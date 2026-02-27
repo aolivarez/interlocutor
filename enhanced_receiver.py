@@ -545,8 +545,9 @@ class EnhancedMessageReceiver:
                 'direction': 'incoming'
             })
 
-            # Accessibility announcements
-            accessibilityAnnouncer.announceNewMessage(from_station, message_text)
+            # NOTE: Accessibility announcements for the web interface are handled
+            # via _notify_web_async('accessibility_announcement', ...) above.
+            # The JS-side accessibilityAnnouncer handles screen reader output.
 
         except UnicodeDecodeError:
             print(f"📨 [{from_station}]: <Binary text data: {len(udp_payload)}B>")
@@ -632,6 +633,16 @@ class EnhancedMessageReceiver:
                 elif event_type == 'control_received':
                     # NEW: Handle control messages separately
                     loop.run_until_complete(self.web_bridge.notify_control_received(data))
+                elif event_type == 'accessibility_announcement':
+                    # Route accessibility announcements directly as their own event type
+                    # — NOT as a message (which would create a ghost bubble in the UI)
+                    if self.web_bridge.web_interface:
+                        loop.run_until_complete(
+                            self.web_bridge.web_interface.broadcast_to_all({
+                                'type': 'accessibility_announcement',
+                                'data': data
+                            })
+                        )
                 else:
                     # All other messages (text, etc.) go to message handler
                     loop.run_until_complete(self.web_bridge.notify_message_received(data))
