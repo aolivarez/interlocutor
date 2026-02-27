@@ -38,6 +38,7 @@ except ImportError:
 # Check for system TTS availability
 import platform
 import subprocess
+import shutil
 SYSTEM_TTS_AVAILABLE = False
 
 if platform.system() == "Windows":
@@ -49,11 +50,10 @@ if platform.system() == "Windows":
     except:
         print("⚠️ Windows SAPI TTS not available")
 elif platform.system() == "Darwin":  # macOS
-    try:
-        subprocess.run(["say", ""], capture_output=True, check=True, timeout=5)
+    if shutil.which("say"):
         SYSTEM_TTS_AVAILABLE = True
         print("✅ macOS 'say' command available")
-    except:
+    else:
         print("⚠️ macOS 'say' command not available")
 elif platform.system() == "Linux":
     try:
@@ -611,6 +611,32 @@ class OpulentVoiceTTS:
         self.logger.info(f"✅ TTS system initialized (engine: {current_engine})")
         return True
 
+    def test_speak(self, text: str = "This is a test of the text to speech system") -> bool:
+        """Test TTS by speaking directly, bypassing config enabled/direction gates.
+        
+        This lets users verify the underlying TTS engine works before
+        committing to enabling it in configuration.
+        """
+        # Ensure engine is loaded (but don't check config enabled flags)
+        if not self.engine_manager.load_attempted:
+            if not self.engine_manager.load_engine():
+                self.logger.warning("TTS engine failed to load during test")
+                return False
+        
+        if not self.engine_manager.engine_loaded:
+            self.logger.warning("TTS engine not available for test")
+            return False
+        
+        # Read voice/rate/volume from config if available, otherwise use defaults
+        try:
+            voice = getattr(self.config.gui.tts, 'voice', 'default') if self.config else 'default'
+            rate = getattr(self.config.gui.tts, 'rate', 200) if self.config else 200
+            volume = getattr(self.config.gui.tts, 'volume', 0.8) if self.config else 0.8
+        except AttributeError:
+            voice, rate, volume = 'default', 200, 0.8
+        
+        return self.engine_manager.speak_text(text, voice=voice, rate=rate, volume=volume)
+
     def update_config(self, new_config):
         """Update configuration and handle engine changes if needed"""
         old_config = self.config
@@ -880,7 +906,7 @@ if __name__ == "__main__":
     tts_manager.add_result_callback(cli_tts_callback)
     
     # Test message
-    test_result = tts_manager.queue_text_message("N0CALL", "Hello, this is a test message", is_outgoing=False)
+    test_result = tts_manager.queue_text_message("W1ABC", "Hello, this is a test message", is_outgoing=False)
     if test_result:
         print("✅ Test message queued for TTS")
         time.sleep(2)  # Give it time to process

@@ -1945,32 +1945,28 @@ class EnhancedRadioWebInterface:
 
 
 	async def handle_test_tts(self, websocket: WebSocket, data: Dict):
-		"""Test TTS functionality"""
+		"""Test TTS functionality - bypasses config enabled gates"""
 		try:
 			test_message = data.get('message', 'This is a test of the text to speech system')
         
-			# Queue test message through TTS system
+			# Use test_speak which bypasses enabled/direction config gates
 			if (self.radio_system and 
 				hasattr(self.radio_system, 'enhanced_receiver') and 
 				self.radio_system.enhanced_receiver and
 				hasattr(self.radio_system.enhanced_receiver, 'tts_manager') and 
 				self.radio_system.enhanced_receiver.tts_manager):
 
-				success = self.radio_system.enhanced_receiver.tts_manager.queue_text_message(
-					str(self.radio_system.station_id), 
-					test_message, 
-					is_outgoing=True  # Use outgoing TTS settings
-				)
+				success = self.radio_system.enhanced_receiver.tts_manager.test_speak(test_message)
             
 				if success:
 					await self.send_to_client(websocket, {
 						"type": "tts_test_result",
-						"data": {"success": True, "message": "TTS test queued successfully"}
+						"data": {"success": True, "message": "TTS test played successfully"}
 					})
 				else:
 					await self.send_to_client(websocket, {
 						"type": "tts_test_result", 
-						"data": {"success": False, "message": "TTS test failed to queue"}
+						"data": {"success": False, "message": "TTS engine not available — check startup log for details"}
 					})
 			else:
 				await self.send_to_client(websocket, {
@@ -2425,6 +2421,10 @@ def setup_chat_integration(chat_interface, web_interface):
 		# Store original display method
 		if hasattr(chat_interface, 'display_received_message'):
 			original_display = chat_interface.display_received_message
+			
+			# Stash the unwrapped original so setup_web_reception_callbacks
+			# can retrieve it later and avoid stacking duplicate wrappers
+			chat_interface._original_display_received_message = original_display
 			
 			# Wrap the display method to also send to web interface
 			def enhanced_display(from_station, message):
