@@ -50,7 +50,7 @@ if platform.system() == "Windows":
         print("⚠️ Windows SAPI TTS not available")
 elif platform.system() == "Darwin":  # macOS
     try:
-        subprocess.run(["say", "--version"], capture_output=True, check=True, timeout=5)
+        subprocess.run(["say", ""], capture_output=True, check=True, timeout=5)
         SYSTEM_TTS_AVAILABLE = True
         print("✅ macOS 'say' command available")
     except:
@@ -880,7 +880,7 @@ if __name__ == "__main__":
     tts_manager.add_result_callback(cli_tts_callback)
     
     # Test message
-    test_result = tts_manager.queue_text_message("W1ABC", "Hello, this is a test message", is_outgoing=False)
+    test_result = tts_manager.queue_text_message("N0CALL", "Hello, this is a test message", is_outgoing=False)
     if test_result:
         print("✅ Test message queued for TTS")
         time.sleep(2)  # Give it time to process
