@@ -385,6 +385,11 @@ class ChatManagerAudioDriven:
 		sent_messages = []
 		for message in self.pending_messages:
 			self.queue_message_for_transmission(message)
+			# Also queue for TTS readback (same as non-PTT path)
+			if self.tts_manager:
+				self.tts_manager.queue_text_message(
+					str(self.station_id), message, is_outgoing=True
+				)
 			sent_messages.append(message)
 		
 		# Show summary
@@ -1802,10 +1807,17 @@ def setup_web_reception_callbacks(radio_system, web_interface, receiver):
 	"""Setup callbacks between radio system and web interface for reception"""
 	
 	# Store original methods if they exist
+	# IMPORTANT: Retrieve the _unwrapped_ original display method if available,
+	# to avoid stacking multiple on_message_received calls. setup_chat_integration()
+	# may have already wrapped display_received_message with its own web notification.
 	original_display = None
 	if (hasattr(radio_system, 'chat_interface') and 
 		hasattr(radio_system.chat_interface, 'display_received_message')):
-		original_display = radio_system.chat_interface.display_received_message
+		# Check if we stored the original before setup_chat_integration wrapped it
+		if hasattr(radio_system.chat_interface, '_original_display_received_message'):
+			original_display = radio_system.chat_interface._original_display_received_message
+		else:
+			original_display = radio_system.chat_interface.display_received_message
 	
 	# Enhanced display method that also notifies web interface
 	def enhanced_display_received_message(from_station, message):
