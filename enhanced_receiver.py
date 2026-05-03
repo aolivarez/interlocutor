@@ -905,35 +905,134 @@ class AudioOutputManager:
             print(f"🔊 Audio queue full, dropping packet from {from_station}")
     
     def _playback_loop(self):
-        """Main playback loop - runs in separate thread"""
+        """Main playback loop - runs in separate thread.
+
+        Uses a small application-level jitter buffer with pre-roll and
+        silence padding to absorb network/scheduling jitter, without
+        touching ALSA/PyAudio buffer geometry.
+
+        Architecture:
+          - Pre-roll: wait for PREROLL_PACKETS in queue (or PREROLL_TIMEOUT_S
+            of wall clock since first packet) before starting to feed ALSA.
+            Short transmissions still play; long ones get a full cushion.
+          - Greedy drain: each loop iteration takes EVERY available packet
+            and concatenates them into one write(). Mimics the recorded-
+            playback path that works flawlessly.
+          - Silence padding: on starvation, write 40 ms of zeros so ALSA's
+            buffer never drains to underrun.
+          - Idle return: after MAX_CONSECUTIVE_SILENCE silence packets,
+            assume transmission ended and go back to pre-roll waiting so
+            the next transmission starts with a fresh cushion.
+
+        This is purely a speaker-rendering change. It does not touch the
+        OPV protocol, the 40 ms TX clock, the priority queues, the web
+        interface notification path, or anything other receivers see.
+        """
         print("🔊 Audio playback loop started")
-        
+
+        # --- Jitter buffer parameters ---
+        PREROLL_PACKETS = 3            # ~120 ms cushion before first write
+        PREROLL_TIMEOUT_S = 0.2        # bail out of pre-roll for short transmissions
+        MAX_CONSECUTIVE_SILENCE = 5    # ~200 ms silence => transmission likely ended
+
+        # 1920 samples * 2 bytes (paInt16) * channels = 3840 bytes for mono @ 48 kHz
+        bytes_per_packet = self.buffer_size * 2 * self.channels
+        silence_packet = b'\x00' * bytes_per_packet
+
+        primed = False
+        preroll_started_at = None
+        consecutive_silence = 0
+        silence_inserted_total = 0
+
         while self.playing:
             try:
-                # Get audio packet from queue
-                audio_packet = self.playback_queue.get(timeout=0.1)
-                
-                # Play the audio
-                pcm_data = audio_packet['pcm_data']
-                from_station = audio_packet['from_station']
-                
+                # --- Pre-roll: wait for cushion (with timeout for short bursts) ---
+                if not primed:
+                    qs = self.playback_queue.qsize()
+                    if qs >= PREROLL_PACKETS:
+                        primed = True
+                        consecutive_silence = 0
+                        preroll_started_at = None
+                        DebugConfig.debug_print(
+                            f"🔊 Jitter buffer primed ({qs} packets queued)"
+                        )
+                    elif qs > 0:
+                        # Start the pre-roll wall-clock watch when first packet arrives
+                        if preroll_started_at is None:
+                            preroll_started_at = time.time()
+                        elif time.time() - preroll_started_at > PREROLL_TIMEOUT_S:
+                            # Short transmission -- play what we've got
+                            primed = True
+                            consecutive_silence = 0
+                            DebugConfig.debug_print(
+                                f"🔊 Pre-roll timeout, starting with {qs} packet(s)"
+                            )
+                            preroll_started_at = None
+                        else:
+                            time.sleep(0.005)
+                            continue
+                    else:
+                        # Nothing in queue at all -- keep waiting
+                        time.sleep(0.005)
+                        continue
+
+                # --- Greedy drain: take every packet currently available ---
+                chunks = []
+                last_station = None
+                sample_count_total = 0
+                try:
+                    while True:
+                        audio_packet = self.playback_queue.get_nowait()
+                        chunks.append(audio_packet['pcm_data'])
+                        last_station = audio_packet['from_station']
+                        sample_count_total += audio_packet['sample_count']
+                except Empty:
+                    pass
+
+                if chunks:
+                    # Real audio available
+                    consecutive_silence = 0
+                    pcm_data = b''.join(chunks)
+                    from_station = last_station
+                else:
+                    # Underflow: feed silence so ALSA never drains to zero
+                    pcm_data = silence_packet
+                    sample_count_total = self.buffer_size
+                    from_station = "SILENCE"
+                    consecutive_silence += 1
+                    silence_inserted_total += 1
+
+                    if consecutive_silence >= MAX_CONSECUTIVE_SILENCE:
+                        # Transmission probably ended -- return to pre-roll wait
+                        primed = False
+                        preroll_started_at = None
+                        DebugConfig.debug_print(
+                            f"🔊 Audio idle, returning to pre-roll wait "
+                            f"(silence packets total: {silence_inserted_total})"
+                        )
+                        continue
+
                 if self.output_stream and self.output_stream.is_active():
-                    # Write PCM data to output stream
+                    # Blocking write -- pumps data into ALSA at ALSA's drain rate.
+                    # When chunks > 1, ALSA accepts what fits and blocks on the
+                    # rest, keeping its internal buffer close to full.
                     self.output_stream.write(pcm_data)
-                    
-                    # Update statistics
-                    self.stats['packets_played'] += 1
-                    self.stats['total_samples_played'] += audio_packet['sample_count']
-                    
-                    print(f"🔊 Playing audio from {from_station}: "
-                          f"{len(pcm_data)}B ({audio_packet['sample_count']} samples)")
-                
+
+                    self.stats['packets_played'] += max(len(chunks), 1)
+                    self.stats['total_samples_played'] += sample_count_total
+
+                    DebugConfig.debug_print(
+                        f"🔊 Playing audio from {from_station}: "
+                        f"{len(pcm_data)}B ({sample_count_total} samples, "
+                        f"{len(chunks)} chunk(s))"
+                    )
+
             except Empty:
-                # No audio to play - normal timeout
+                # Defensive: shouldn't reach here with get_nowait, but harmless
                 continue
             except Exception as e:
                 print(f"🔊 Playback error: {e}")
-                time.sleep(0.01)  # Brief pause on error
+                time.sleep(0.01)
         
     
     def get_stats(self):
