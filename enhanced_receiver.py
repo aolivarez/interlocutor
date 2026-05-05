@@ -173,6 +173,7 @@ class WebSocketBridge:
 
 
 
+postamble = bytes.fromhex("e2 5c 4b 89 71 2e 25 c4 b8 97 12") * 11 + bytes.fromhex("00")
 
 
 class EnhancedMessageReceiver:
@@ -293,7 +294,18 @@ class EnhancedMessageReceiver:
             if station_bytes in self.block_list:
                 DebugConfig.debug_print(f"🚫 blocked frame from: {station_bytes.hex()}")
                 return
-
+            
+            # Step 1.1: discard dummy frames
+            if not any(fragment_payload):
+                DebugConfig.debug_print(f"🚫 discarded dummy frame from: {str(StationIdentifier.from_bytes(station_bytes))}")
+                return
+            
+            # Step 1.2: discard postamble frames
+            if fragment_payload == postamble:
+                DebugConfig.debug_print(f"🚫 discarded postamble frame from: {str(StationIdentifier.from_bytes(station_bytes))}")
+                # !!! ptw - need to actually process the postamble for timeline shutdown
+                return
+            
             # Step 2: Try to reassemble COBS frames
             cobs_frames = self.reassembler.add_frame_payload(fragment_payload)
 
