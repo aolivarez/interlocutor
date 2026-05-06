@@ -391,7 +391,7 @@ class COBSFrameBoundaryManager:
 
 		except Exception as e:
 			# Always show decode failures (they're important)
-			print(f"❌ COBS decode failed: {len(encoded_data)}B frame - {e}")
+			print(f"❌ COBS decode failed: {len(encoded_data)}B frame - {e} {decoded_frame.hex()}")
 			self.stats['decoding_errors'] += 1
 			raise ValueError(f"COBS decoding failed: {e}")
 
