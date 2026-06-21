@@ -169,11 +169,17 @@ except ImportError:
 	sys.exit(1)
 
 try:
-	from gpiozero import Button, LED
+	from gpiozero import Button, LED, Device
+	from gpiozero.pins import PiBoardInfo
+	# Verify we're actually on a Raspberry Pi
+	PiBoardInfo.from_revision(None)
+	GPIOZERO_AVAILABLE = True
 	print("gpiozero ready and standing by")
-except ImportError:
-	print("Please install gpiozero.")
-	raise
+except (ImportError, Exception) as e:
+	GPIOZERO_AVAILABLE = False
+	Button = None
+	LED = None
+	print(f"gpiozero not available ({e}) - GPIO features disabled, chat-only/web modes still work")
 
 
 # ===================================================================
@@ -648,7 +654,7 @@ class AudioDrivenFrameManager:
 
 class MessageReceiver:
 	"""Handles receiving and parsing incoming messages"""
-	def __init__(self, listen_port=57372, chat_interface=None):
+	def __init__(self, listen_port=57373, chat_interface=None):
 		self.listen_port = listen_port
 		self.chat_interface = chat_interface
 		self.socket = None
@@ -804,12 +810,17 @@ class GPIOZeroPTTHandler:
 		self.station_id = station_identifier
 
 		# GPIO setup with gpiozero using config values
-		self.ptt_button = Button(
-				config.gpio.ptt_pin,
-				pull_up=True,
-				bounce_time=config.gpio.button_bounce_time
-		)
-		self.led = LED(config.gpio.led_pin)
+		if GPIOZERO_AVAILABLE:
+			self.ptt_button = Button(
+					config.gpio.ptt_pin,
+					pull_up=True,
+					bounce_time=config.gpio.button_bounce_time
+			)
+			self.led = LED(config.gpio.led_pin)
+		else:
+			self.ptt_button = None
+			self.led = None
+			print("⚠️ GPIO not available - PTT button and LED disabled")
 		self.ptt_active = False
 
 		# Audio configuration from config
@@ -884,6 +895,9 @@ class GPIOZeroPTTHandler:
 
 	def setup_gpio_callbacks(self):
 		"""Setup PTT button callbacks"""
+		if not self.ptt_button:
+			DebugConfig.debug_print("⚠️ GPIO not available - skipping PTT button callbacks")
+			return
 		self.ptt_button.when_pressed = self.ptt_pressed
 		self.ptt_button.when_released = self.ptt_released
 		DebugConfig.debug_print(f"✓ GPIO setup: PTT=GPIO{self.ptt_button.pin}, LED=GPIO{self.led.pin}")
@@ -985,7 +999,7 @@ class GPIOZeroPTTHandler:
 			self.enhanced_receiver = EnhancedMessageReceiver(
 				listen_port=self.config.network.listen_port,
 				chat_interface=self.chat_interface,
-				block_list=[self.station_id.to_bytes()],  # Block own frames only for now
+				block_list=[],  # Block own frames only for now
 			)
 
 			# Setup audio output with the independently selected OUTPUT device
@@ -1034,7 +1048,7 @@ class GPIOZeroPTTHandler:
 			self.enhanced_receiver = EnhancedMessageReceiver(
 				listen_port=self.config.network.listen_port,
 				chat_interface=self.chat_interface,
-				block_list=[self.station_id.to_bytes()],  # Block own frames only for now
+				block_list=[],  # Block own frames only for now
 			)
 		
 			# Setup audio output if we have device info (same as web interface mode)
@@ -1351,7 +1365,8 @@ class GPIOZeroPTTHandler:
 
 
 		# LED on
-		self.led.on()
+		if self.led:
+			self.led.on()
 
 	def ptt_released(self):
 		"""PTT button released - send control message IMMEDIATELY after voice stops"""
@@ -1413,7 +1428,8 @@ class GPIOZeroPTTHandler:
 			self.print_stats()
 
 		# LED off
-		self.led.off()
+		if self.led:
+			self.led.off()
 
 
 
@@ -1506,6 +1522,9 @@ class GPIOZeroPTTHandler:
 
 	def test_gpio(self):
 		"""Test GPIO functionality"""
+		if not self.led or not self.ptt_button:
+			print("⚠️ GPIO not available - skipping GPIO test")
+			return
 		print("🧪 Testing GPIOS...")
 		self.led.off()
 		for i in range(3):
@@ -1667,7 +1686,8 @@ class GPIOZeroPTTHandler:
 			self.enhanced_receiver.stop()
 
 		self.transmitter.close()
-		self.led.off()
+		if self.led:
+			self.led.off()
 		print(f"Thank you for shopping at Omega Mart. {self.station_id} cleanup complete.")
 
 
