@@ -910,8 +910,87 @@ class GPIOZeroPTTHandler:
 			if info['maxInputChannels'] > 0:  # Has input capability
 				DebugConfig.debug_print(f"   Device {i}: {info['name']} (inputs: {info['maxInputChannels']}, rate: {info['defaultSampleRate']})")
 
+	def _load_wav_48k_mono(self, path):
+		"""Read a WAV file and return 48 kHz mono signed-16-bit PCM bytes.
+		Already-48k/mono/16-bit files need no conversion; other formats use the
+		stdlib audioop module if available, else raise a clear ffmpeg hint."""
+		import wave
+		with wave.open(path, 'rb') as w:
+			nch, sw, rate = w.getnchannels(), w.getsampwidth(), w.getframerate()
+			pcm = w.readframes(w.getnframes())
+		hint = (f"convert it:  ffmpeg -i '{path}' -ar 48000 -ac 1 "
+		        f"-c:a pcm_s16le out.wav")
+		if sw != 2:
+			try:
+				import audioop; pcm = audioop.lin2lin(pcm, sw, 2); sw = 2
+			except Exception:
+				raise RuntimeError(f"{path}: need 16-bit PCM (got {sw*8}-bit); {hint}")
+		if nch == 2:
+			import audioop; pcm = audioop.tomono(pcm, 2, 0.5, 0.5); nch = 1
+		elif nch != 1:
+			raise RuntimeError(f"{path}: need mono or stereo (got {nch} channels); {hint}")
+		if rate != 48000:
+			try:
+				import audioop; pcm, _ = audioop.ratecv(pcm, 2, 1, rate, 48000, None)
+			except Exception:
+				raise RuntimeError(f"{path}: need 48000 Hz (got {rate}); {hint}")
+		return pcm
+
+	def play_audio_file(self, path, loop=False):
+		"""Transmit a WAV file as ONE continuous voice transmission: key PTT,
+		stream every 40 ms frame through the normal encode/transmit path, then
+		release. With loop=True, repeat until Ctrl+C."""
+		pcm = self._load_wav_48k_mono(path)
+		fb = self.bytes_per_frame                       # 3840 bytes = 1920 samples
+		nframes = (len(pcm) + fb - 1) // fb
+		dur = nframes * self.frame_duration_ms / 1000.0
+		DebugConfig.system_print(
+			f"📁 Transmitting {path}: {nframes} frames (~{dur:.1f}s) "
+			f"-> {self.transmitter.target_ip}:{self.transmitter.target_port}"
+			+ (" [looping]" if loop else ""))
+		try:
+			while True:
+				self.ptt_pressed()                      # key up (sends PTT_START)
+				next_t = time.time()
+				for i in range(nframes):
+					frame = pcm[i*fb:(i+1)*fb]
+					if len(frame) < fb:                 # pad final partial frame
+						frame += b'\x00' * (fb - len(frame))
+					self.audio_callback(frame, self.samples_per_frame, None, 0)
+					next_t += self.frame_duration_ms / 1000.0
+					delay = next_t - time.time()
+					if delay > 0:
+						time.sleep(delay)
+					else:
+						next_t = time.time()            # drifted -> resync
+				self.ptt_released()                     # key down at end of file
+				if not loop:
+					break
+				time.sleep(0.2)                         # brief gap between loops
+		except KeyboardInterrupt:
+			DebugConfig.system_print("\n📁 File transmit interrupted")
+		finally:
+			if self.ptt_active:
+				self.ptt_released()
+		DebugConfig.system_print("📁 File transmit complete")
+
 	def setup_audio(self, force_device_selection=False):
 		"""Setup audio input and output with optional device selection"""
+		# File-transmit mode: no live microphone. The file player feeds frames
+		# straight into audio_callback, so just enforce the protocol params.
+		if getattr(self.config, 'audio_file', None):
+			self.sample_rate = 48000
+			self.frame_duration_ms = 40
+			self.samples_per_frame = 1920
+			self.bytes_per_frame = self.samples_per_frame * 2
+			self.audio_input_stream = None
+			self.selected_input_device = None
+			self.selected_output_device = None
+			self.audio_params = {'sample_rate': 48000, 'frame_duration_ms': 40,
+			                     'frames_per_buffer': 1920, 'channels': 1}
+			DebugConfig.system_print("📁 File transmit mode: live microphone disabled")
+			return
+
 		# create device manager with our config
 		device_manager = AudioDeviceManager(
 			mode=AudioManagerMode.INTERACTIVE,
@@ -1930,6 +2009,21 @@ if __name__ == "__main__":
 		if config.debug.verbose:
 			DebugConfig.debug_print("💡 Configuration loaded from file and CLI overrides")
 		DebugConfig.system_print("")
+
+		# File transmit mode: fake the microphone from a WAV file and hold PTT
+		# for the whole file (continuous transmission). Lets one machine run
+		# several file-fed transmitters, each with its own callsign/port.
+		if getattr(config, 'audio_file', None):
+			print(f"📁 Starting in file transmit mode: {config.audio_file}")
+			radio = GPIOZeroPTTHandler(
+				station_identifier=station_id,
+				config=config
+			)
+			radio.play_audio_file(
+				config.audio_file,
+				loop=getattr(config, 'audio_file_loop', False)
+			)
+			sys.exit(0)
 
 		# Check for web interface mode first
 		if hasattr(config, 'ui') and hasattr(config.ui, 'web_interface_enabled') and config.ui.web_interface_enabled:

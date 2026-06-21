@@ -648,6 +648,12 @@ class ConfigurationManager:
 		if hasattr(args, 'chat_only') and args.chat_only:
 			self.config.ui.chat_only_mode = True
 
+		# Audio file transmit (fake the mic from a WAV file)
+		if hasattr(args, 'audio_file') and args.audio_file:
+			self.config.audio_file = args.audio_file
+		if hasattr(args, 'loop_audio') and args.loop_audio:
+			self.config.audio_file_loop = True
+
 		# IMPORTANT: Always return the config object
 		return self.config
 
@@ -1263,7 +1269,22 @@ Configuration:
 		action='store_true',
 		help='Interactive audio device setup and exit'
 	)
-	
+	audio_group.add_argument(
+		'--audio-file',
+		metavar='WAV',
+		default=None,
+		help='Transmit a WAV file as continuous voice instead of a live '
+		     'microphone (PTT held for the whole file). 48kHz mono 16-bit is '
+		     'ideal; other rates/channels are auto-converted when the audioop '
+		     'module is available. Lets one machine run several file-fed '
+		     'transmitters, each with its own callsign/port.'
+	)
+	audio_group.add_argument(
+		'--loop-audio',
+		action='store_true',
+		help='With --audio-file, loop the file continuously until Ctrl+C'
+	)
+
 	# Protocol settings
 	protocol_group = parser.add_argument_group('Protocol Settings')
 	protocol_group.add_argument(
