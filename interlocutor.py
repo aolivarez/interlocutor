@@ -1129,7 +1129,9 @@ class GPIOZeroPTTHandler:
 			return None
 		try:
 			from enhanced_receiver import MultiStationReceiver
-			self.mix_receiver = MultiStationReceiver(listen_port=port)
+			self.mix_receiver = MultiStationReceiver(
+				listen_port=port,
+				max_talkers=getattr(self.config.network, 'mix_max_talkers', 4))
 			self.mix_receiver.start()
 		except Exception as e:
 			DebugConfig.system_print(f"⚠️ Multi-station mix receiver not started: {e}")
@@ -2068,7 +2070,9 @@ if __name__ == "__main__":
 			receiver.start()
 			mix = None
 			if config.network.mix_port:
-				mix = MultiStationReceiver(listen_port=config.network.mix_port)
+				mix = MultiStationReceiver(
+					listen_port=config.network.mix_port,
+					max_talkers=getattr(config.network, 'mix_max_talkers', 4))
 				mix.start()
 			print(f"👂 Listen {config.network.listen_port}"
 			      f"{f' | 🎚️  mix {config.network.mix_port}' if mix else ''} — Ctrl+C to stop")

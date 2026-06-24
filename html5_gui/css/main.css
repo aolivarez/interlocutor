@@ -881,3 +881,57 @@ body {
 .status-warning { color: var(--warning-color) !important; }
 .status-error { color: var(--error-color) !important; }
 .status-info { color: var(--text-secondary) !important; }
+
+/* ===== Active Mix bubble (multi-station mixer console) ===== */
+.mix-bubble {
+	margin: 0 0 0.6rem;
+	border: 1px solid rgba(130, 170, 210, 0.35);
+	border-radius: 10px;
+	background: rgba(20, 26, 34, 0.6);
+	padding: 0.5rem 0.6rem;
+}
+.mix-bubble[hidden] { display: none; }
+.mix-bubble-head {
+	display: flex; align-items: baseline; justify-content: space-between;
+	margin-bottom: 0.4rem;
+}
+.mix-bubble-title { font-weight: 600; }
+.mix-bubble-summary { font-size: 0.8rem; opacity: 0.7; }
+.mix-bubble-rows { display: flex; flex-direction: column; gap: 0.3rem; }
+
+.mix-row {
+	display: grid;
+	grid-template-columns: 14px 7.5rem 1fr auto auto 7rem;
+	align-items: center; gap: 0.5rem;
+	padding: 0.25rem 0.35rem;
+	border-radius: 7px;
+	background: rgba(255, 255, 255, 0.03);
+}
+.mix-row.inaudible { opacity: 0.45; }       /* present but beyond the cap / muted */
+.mix-row.muted .mix-call { text-decoration: line-through; }
+
+.mix-dot {
+	width: 9px; height: 9px; border-radius: 50%;
+	background: #3a4654; justify-self: center;
+}
+.mix-dot.talking { background: #39d353; box-shadow: 0 0 6px #39d353; }
+
+.mix-call { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* pan: a track with a dot positioned left(0%)..right(100%) */
+.mix-pan { position: relative; height: 4px; border-radius: 2px;
+	background: linear-gradient(90deg, #2b3a4d, #4a5d75); }
+.mix-pan-dot {
+	position: absolute; top: 50%; width: 8px; height: 8px; border-radius: 50%;
+	background: #bfe9ff; transform: translate(-50%, -50%);
+}
+
+.mix-btn {
+	width: 1.6rem; height: 1.6rem; border-radius: 5px; cursor: pointer;
+	border: 1px solid rgba(130, 170, 210, 0.35);
+	background: transparent; color: inherit; font-weight: 700; line-height: 1;
+}
+.mix-mute.on { background: #5a1f1f; border-color: #ff6b6b; color: #ffb3b3; }
+.mix-solo.on { background: #5a4a14; border-color: #ffd24a; color: #ffe9a8; }
+
+.mix-gain { width: 7rem; }

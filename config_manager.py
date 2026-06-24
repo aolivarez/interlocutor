@@ -272,6 +272,7 @@ class NetworkConfig:
 	target_port: int = 57372
 	listen_port: int = 57372
 	mix_port: int = 7091                 # multi-station monitor/mixer port (0 = off)
+	mix_max_talkers: int = 4             # cap the live mix to N most-recent (0 = no cap)
 	encap_mode: str = "UDP"
 	target_type: str = "computer"       # "computer" or "modem" - also in protocol for compat
 	keepalive_interval: float = 2.0     # Interval for keepalive frames - also in protocol for compat
@@ -428,6 +429,7 @@ class OpulentVoiceConfig:
 			config.network.target_port = net_data.get('target_port', config.network.target_port)
 			config.network.listen_port = net_data.get('listen_port', config.network.listen_port)
 			config.network.mix_port = net_data.get('mix_port', config.network.mix_port)
+			config.network.mix_max_talkers = net_data.get('mix_max_talkers', config.network.mix_max_talkers)
 			config.network.encap_mode = net_data.get('encap_mode', config.network.encap_mode)
 			config.network.target_type = net_data.get('target_type', config.network.target_type)
 			config.network.keepalive_interval = net_data.get('keepalive_interval', config.network.keepalive_interval)
@@ -631,6 +633,8 @@ class ConfigurationManager:
 			self.config.network.listen_port = args.listen_port
 		if hasattr(args, 'mix_port') and args.mix_port is not None:
 			self.config.network.mix_port = args.mix_port
+		if hasattr(args, 'max_talkers') and args.max_talkers is not None:
+			self.config.network.mix_max_talkers = args.max_talkers
 		if hasattr(args, 'encap_mode') and args.encap_mode:
 			self.config.network.encap_mode = args.encap_mode
 
@@ -1254,6 +1258,13 @@ Configuration:
 		default=None,
 		help='Multi-station monitor/mixer port (default 7091; 0 to disable). '
 		     'The rx-dashboard forwards 2+ selected channels here.'
+	)
+	network_group.add_argument(
+		'--max-talkers',
+		type=int,
+		default=None,
+		help='Cap the live mix to the N most-recently-keyed stations '
+		     '(default 4; 0 = no cap). Keeps large selections listenable.'
 	)
 
 	# GPIO settings

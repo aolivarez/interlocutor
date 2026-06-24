@@ -789,3 +789,106 @@ window.radioInterface = {
 	attemptReconnect,
 	initializeReceptionFeatures
 };
+
+
+// ===================================================================
+// Active Mix bubble — one combined widget for all active stations.
+// Driven by `mix_state` broadcasts; controls send `mix_control`.
+// ===================================================================
+var _mixRows = {};   // callsign -> { row, dot, pan, mute, solo, gain }
+
+function sendMixControl(callsign, patch) {
+	if (typeof sendWebSocketMessage === 'function') {
+		sendWebSocketMessage('mix_control', Object.assign({ callsign: callsign }, patch));
+	}
+}
+
+function _makeMixRow(st) {
+	var row = document.createElement('div');
+	row.className = 'mix-row';
+	row.dataset.callsign = st.callsign;
+
+	var dot = document.createElement('span');
+	dot.className = 'mix-dot';
+	dot.setAttribute('aria-hidden', 'true');
+
+	var name = document.createElement('span');
+	name.className = 'mix-call';
+	name.textContent = st.callsign;
+
+	var pan = document.createElement('span');
+	pan.className = 'mix-pan'; pan.title = 'pan';
+	var panDot = document.createElement('span');
+	panDot.className = 'mix-pan-dot';
+	pan.appendChild(panDot);
+
+	var mute = document.createElement('button');
+	mute.className = 'mix-btn mix-mute'; mute.type = 'button';
+	mute.textContent = 'M'; mute.title = 'Mute';
+	mute.addEventListener('click', function () {
+		sendMixControl(st.callsign, { muted: !mute.classList.contains('on') });
+	});
+
+	var solo = document.createElement('button');
+	solo.className = 'mix-btn mix-solo'; solo.type = 'button';
+	solo.textContent = 'S'; solo.title = 'Solo';
+	solo.addEventListener('click', function () {
+		sendMixControl(st.callsign, { solo: !solo.classList.contains('on') });
+	});
+
+	var gain = document.createElement('input');
+	gain.className = 'mix-gain'; gain.type = 'range';
+	gain.min = '0'; gain.max = '2'; gain.step = '0.05'; gain.title = 'Gain';
+	gain.addEventListener('input', function () {
+		sendMixControl(st.callsign, { gain: parseFloat(gain.value) });
+	});
+
+	row.appendChild(dot); row.appendChild(name); row.appendChild(pan);
+	row.appendChild(mute); row.appendChild(solo); row.appendChild(gain);
+
+	_mixRows[st.callsign] = { row: row, dot: dot, pan: panDot,
+	                          mute: mute, solo: solo, gain: gain };
+	return row;
+}
+
+function _updateMixRow(r, st) {
+	r.dot.classList.toggle('talking', !!st.talking);
+	r.row.classList.toggle('inaudible', !st.audible);
+	r.row.classList.toggle('muted', !!st.muted);
+	r.mute.classList.toggle('on', !!st.muted);
+	r.solo.classList.toggle('on', !!st.solo);
+	r.pan.style.left = Math.round((st.pan + 1) / 2 * 100) + '%';
+	// don't fight the user while they drag the gain slider
+	if (document.activeElement !== r.gain) r.gain.value = st.gain;
+}
+
+function renderMixBubble(data) {
+	var bubble = document.getElementById('mix-bubble');
+	var rowsEl = document.getElementById('mix-bubble-rows');
+	var summary = document.getElementById('mix-bubble-summary');
+	if (!bubble || !rowsEl) return;
+	var stations = (data && data.stations) || [];
+
+	if (!stations.length) {
+		bubble.hidden = true;
+		rowsEl.innerHTML = '';
+		_mixRows = {};
+		return;
+	}
+	bubble.hidden = false;
+
+	var present = {}, audible = 0;
+	stations.forEach(function (st) {
+		present[st.callsign] = true;
+		if (st.audible) audible++;
+		var r = _mixRows[st.callsign];
+		if (!r) { rowsEl.appendChild(_makeMixRow(st)); r = _mixRows[st.callsign]; }
+		_updateMixRow(r, st);
+	});
+	Object.keys(_mixRows).forEach(function (cs) {
+		if (!present[cs]) { _mixRows[cs].row.remove(); delete _mixRows[cs]; }
+	});
+
+	var cap = data.max_talkers ? (' · cap ' + data.max_talkers) : '';
+	summary.textContent = stations.length + ' active · ' + audible + ' audible' + cap;
+}

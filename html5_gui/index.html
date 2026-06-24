@@ -134,10 +134,20 @@
 					<div id="ptt-help" style="position: absolute; left: -10000px; width: 1px; height: 1px; overflow: hidden;">Press and hold to transmit voice message, release to stop</div>
 				</div>
 				
-				<div id="message-history" 
-					 class="message-history" 
-					 role="log" 
-					 aria-live="polite" 
+				<!-- Active Mix bubble: one combined widget for all active stations -->
+				<div id="mix-bubble" class="mix-bubble" role="region"
+					 aria-label="Active mix" hidden>
+					<div class="mix-bubble-head">
+						<span class="mix-bubble-title">🎚 Active Mix</span>
+						<span id="mix-bubble-summary" class="mix-bubble-summary"></span>
+					</div>
+					<div id="mix-bubble-rows" class="mix-bubble-rows"></div>
+				</div>
+
+				<div id="message-history"
+					 class="message-history"
+					 role="log"
+					 aria-live="polite"
 					 aria-label="Message history"
 					 tabindex="0">
 					<div class="message system">

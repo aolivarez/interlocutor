@@ -207,7 +207,11 @@ function handleWebSocketMessage(message) {
 		case 'status_update':
 			updateSystemStatus(message.data);
 			break;
-			
+
+		case 'mix_state':
+			if (typeof renderMixBubble === 'function') renderMixBubble(message.data);
+			break;
+
 		case 'error':
 			showNotification(message.message || 'An error occurred', 'error');
 			addLogEntry(`Error: ${message.message}`, 'error');

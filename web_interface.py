@@ -640,6 +640,44 @@ class EnhancedRadioWebInterface:
 
 
 	# Also add debug to the broadcast method (just above)
+	def _mix_receiver(self):
+		"""The multi-station mixer, if running (web/full-CLI start it on the radio)."""
+		return getattr(self.radio_system, 'mix_receiver', None)
+
+	async def handle_mix_control(self, data: Dict):
+		"""Apply a per-station mute/solo/gain from the Active Mix bubble, then
+		push a fresh roster so every client updates immediately."""
+		mix = self._mix_receiver()
+		if not mix:
+			return
+		callsign = data.get('callsign')
+		if not callsign:
+			return
+		mix.set_control(
+			callsign,
+			muted=data.get('muted'),
+			solo=data.get('solo'),
+			gain=data.get('gain'),
+		)
+		await self.broadcast_mix_state()
+
+	async def broadcast_mix_state(self):
+		"""Send the current Active Mix roster to all clients."""
+		mix = self._mix_receiver()
+		if not mix:
+			return
+		await self.broadcast_to_all({"type": "mix_state", "data": mix.roster()})
+
+	async def mix_state_loop(self, interval: float = 0.25):
+		"""Periodic Active Mix roster push (~4 Hz) so the bubble stays live."""
+		while True:
+			try:
+				if self.websocket_clients and self._mix_receiver():
+					await self.broadcast_mix_state()
+			except Exception as e:
+				DebugConfig.debug_print(f"mix_state_loop error: {e}")
+			await asyncio.sleep(interval)
+
 	async def broadcast_to_all(self, message: Dict):
 		"""Broadcast message to all connected clients with debugging"""
 		if not self.websocket_clients:
@@ -1156,7 +1194,11 @@ class EnhancedRadioWebInterface:
 				await self.handle_get_message_history(websocket)
 			elif command == 'clear_message_history':  # NEW
 				await self.handle_clear_message_history()
-			
+
+			# Multi-station mixer: per-station mute/solo/gain from the Active Mix bubble
+			elif command == 'mix_control':
+				await self.handle_mix_control(data)
+
 			else:
 				self.logger.warning(f"Unknown command: {command}")
 				await self.send_to_client(websocket, {
@@ -2370,6 +2412,13 @@ class EnhancedRadioWebInterface:
 
 # FastAPI application setup
 app = FastAPI(title="Opulent Voice Web Interface", version="1.0.0")
+
+
+@app.on_event("startup")
+async def _start_mix_state_loop():
+	"""Background task: push the Active Mix roster to clients ~4 Hz."""
+	if web_interface:
+		asyncio.create_task(web_interface.mix_state_loop())
 
 # Add CORS middleware for development
 app.add_middleware(

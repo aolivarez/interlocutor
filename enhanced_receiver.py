@@ -1146,10 +1146,12 @@ class _StationStream:
         self.voice_frames = 0
         self.last_pcm = None          # most recent decoded PCM
         self.last_seen = time.time()
+        self.started_at = time.time()  # onset of the current transmission (last-N rank)
         # --- mixer state (step 2) ---
         self.pcm_queue = deque(maxlen=16)   # decoded 40 ms PCM frames awaiting mix
         self.gain = 1.0                     # per-station gain (UI later)
         self.muted = False                  # per-station mute (UI later)
+        self.solo = False                   # per-station solo (UI later)
         self.pan = 0.0                      # -1 = hard left .. +1 = hard right
         self.pan_gains = (0.707, 0.707)     # (left, right) constant-power weights
 
@@ -1177,11 +1179,12 @@ class MultiStationReceiver:
     PAN_SLOTS = (-0.8, 0.8, 0.0, -1.0, 1.0, -0.4, 0.4)
 
     def __init__(self, listen_port=7091, status_interval=1.0,
-                 play=True, record_path=None):
+                 play=True, record_path=None, max_talkers=4):
         self.listen_port = listen_port
         self.status_interval = status_interval
         self.play = play                # open a stereo output device for the mix
         self.record_path = record_path  # also write the mixed stereo to this WAV
+        self.max_talkers = max_talkers  # cap the live mix to the N most recent (0 = no cap)
         self.socket = None
         self.running = False
         self.receive_thread = None
@@ -1272,6 +1275,43 @@ class MultiStationReceiver:
             return sorted(s.callsign for s in self.stations.values()
                           if now - s.last_seen < self.ACTIVE_TIMEOUT_S)
 
+    def roster(self):
+        """Snapshot of the active mix for the UI: one entry per active station,
+        newest talk-onset first, with pan/gain/mute/solo, whether it's currently
+        audible (within the last-N cap), and whether it's talking right now."""
+        now = time.time()
+        with self.lock:
+            active = [s for s in self.stations.values()
+                      if now - s.last_seen < self.ACTIVE_TIMEOUT_S]
+            audible = self._audible_set(active)
+            active.sort(key=lambda s: s.started_at, reverse=True)
+            return {
+                'max_talkers': self.max_talkers,
+                'stations': [{
+                    'callsign': s.callsign,
+                    'pan': round(s.pan, 2),
+                    'gain': round(s.gain, 2),
+                    'muted': s.muted,
+                    'solo': s.solo,
+                    'audible': s in audible,
+                    'talking': (now - s.last_seen) < 0.25,
+                } for s in active],
+            }
+
+    def set_control(self, callsign, muted=None, solo=None, gain=None):
+        """Apply a per-station control from the UI. Returns True if matched."""
+        with self.lock:
+            for s in self.stations.values():
+                if s.callsign == callsign:
+                    if muted is not None:
+                        s.muted = bool(muted)
+                    if solo is not None:
+                        s.solo = bool(solo)
+                    if gain is not None:
+                        s.gain = max(0.0, min(2.0, float(gain)))
+                    return True
+        return False
+
     def _receive_loop(self):
         while self.running:
             try:
@@ -1302,6 +1342,7 @@ class MultiStationReceiver:
         if fragment_payload == postamble:      # end-of-burst marker
             return
 
+        now = time.time()
         with self.lock:
             st = self.stations.get(station_bytes)
             if st is None:
@@ -1311,7 +1352,9 @@ class MultiStationReceiver:
                 self.stations[station_bytes] = st
                 print(f"🎚️  + {st.callsign} joined mix @ pan {st.pan:+.1f} "
                       f"({len(self.stations)} station(s) seen)")
-            st.last_seen = time.time()
+            elif now - st.last_seen >= self.ACTIVE_TIMEOUT_S:
+                st.started_at = now           # re-keyed after silence -> new onset
+            st.last_seen = now
 
         # Per-station: reassemble -> COBS-decode -> IP/UDP -> voice -> Opus.
         for frame in st.reassembler.add_frame_payload(fragment_payload):
@@ -1356,18 +1399,34 @@ class MultiStationReceiver:
                 print(f"🎚️  active [{len(active)}]: {summary}")
 
     # ----- step 2: stereo mixer -----
+    def _audible_set(self, active):
+        """Step 4 — active-talker cap (last-N). From the currently active
+        stations, choose which are actually mixed: any soloed stations win;
+        otherwise the un-muted N most-recently-keyed (newest talk-onset first),
+        so heavy load stays bounded and intelligible. 0 = no cap."""
+        soloed = [s for s in active if getattr(s, 'solo', False)]
+        if soloed:
+            return set(soloed)
+        candidates = [s for s in active if not s.muted]
+        candidates.sort(key=lambda s: s.started_at, reverse=True)   # newest onset first
+        if self.max_talkers and self.max_talkers > 0:
+            candidates = candidates[:self.max_talkers]
+        return set(candidates)
+
     def _mix_one_frame(self):
-        """Pull one 40 ms PCM frame from each active, un-muted station; pan +
-        sum into a single 40 ms interleaved-stereo frame (saturating)."""
+        """Pull one 40 ms PCM frame from EVERY active station (draining queues so
+        non-audible ones stay current), but pan + sum only the audible set
+        (post-cap) into one 40 ms interleaved-stereo frame (saturating)."""
         now = time.time()
         with self.lock:
-            live = [s for s in self.stations.values()
-                    if now - s.last_seen < self.ACTIVE_TIMEOUT_S and not s.muted]
+            active = [s for s in self.stations.values()
+                      if now - s.last_seen < self.ACTIVE_TIMEOUT_S]
+        audible = self._audible_set(active)
         acc = None
-        for st in live:
+        for st in active:
             frame = st.pcm_queue.popleft() if st.pcm_queue else None
-            if not frame:
-                continue                       # this station has no audio this tick
+            if st not in audible or not frame:
+                continue                       # drained but not summed
             if len(frame) != self._mono_bytes:
                 frame = (frame + self._silence_mono)[:self._mono_bytes]
             lg, rg = st.pan_gains
@@ -1447,9 +1506,11 @@ if __name__ == "__main__":
     ap.add_argument("--no-play", action="store_true", help="don't open an output device")
     ap.add_argument("--mix-record", metavar="WAV", default=None,
                     help="also write the mixed stereo to a WAV (headless-safe)")
+    ap.add_argument("--max-talkers", type=int, default=4,
+                    help="cap the live mix to the N most-recent talkers (0 = no cap)")
     a = ap.parse_args()
     rx = MultiStationReceiver(listen_port=a.mix_port, play=not a.no_play,
-                              record_path=a.mix_record)
+                              record_path=a.mix_record, max_talkers=a.max_talkers)
     rx.start()
     print("🎚️  Ctrl+C to stop")
     try:
