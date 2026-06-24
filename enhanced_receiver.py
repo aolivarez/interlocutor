@@ -1193,7 +1193,9 @@ class MultiStationReceiver:
         self.lock = threading.Lock()
         self.stations = {}           # station_bytes -> _StationStream
         self._pan_idx = 0
-        self.stats = {'datagrams': 0, 'voice_frames': 0, 'decode_errors': 0}
+        self.text_callback = None    # set to fn(callsign, text) to surface text msgs
+        self.stats = {'datagrams': 0, 'voice_frames': 0, 'decode_errors': 0,
+                      'text_msgs': 0}
         # mix output state
         self._pa = None
         self.out_stream = None
@@ -1399,35 +1401,43 @@ class MultiStationReceiver:
                 st.started_at = now           # re-keyed after silence -> new onset
             st.last_seen = now
 
-        # Per-station: reassemble -> COBS-decode -> IP/UDP -> voice -> Opus.
+        # Per-station: reassemble -> COBS-decode -> IP/UDP -> voice (Opus) or text.
         for frame in st.reassembler.add_frame_payload(fragment_payload):
             try:
                 ip_frame, _ = st.cobs_manager.decode_frame(frame)
             except Exception:
                 self.stats['decode_errors'] += 1
                 continue
-            pcm = self._decode_voice(st, ip_frame)
-            if pcm:
-                st.last_pcm = pcm
-                st.pcm_queue.append(pcm)        # hand to the mixer
-                st.voice_frames += 1
-                self.stats['voice_frames'] += 1
+            port, payload = self._ip_udp(ip_frame)
+            if port == 57373:                        # voice
+                pcm = (st.decoder.decode_opus(payload[12:])    # strip 12-byte RTP
+                       if len(payload) >= 12 else None)
+                if pcm:
+                    st.last_pcm = pcm
+                    st.pcm_queue.append(pcm)         # hand to the mixer
+                    st.voice_frames += 1
+                    self.stats['voice_frames'] += 1
+            elif port == 57374 and self.text_callback:   # text -> chat (per callsign)
+                try:
+                    text = payload.decode('utf-8')
+                except UnicodeDecodeError:
+                    text = None
+                if text:
+                    self.stats['text_msgs'] += 1
+                    try:
+                        self.text_callback(st.callsign, text)
+                    except Exception:
+                        pass
 
-    def _decode_voice(self, st, ip_frame):
-        """Pull the voice payload (encapsulated UDP dest 57373) and Opus-decode
-        it through this station's own decoder. Text/control ignored for now."""
+    def _ip_udp(self, ip_frame):
+        """(dest_port, udp_payload) from an encapsulated IP frame, or (None, b'')."""
         if len(ip_frame) < 20:
-            return None
+            return None, b''
         ihl = (ip_frame[0] & 0x0F) * 4
         if len(ip_frame) < ihl + 8:
-            return None
+            return None, b''
         dest_port = struct.unpack('!H', ip_frame[ihl + 2:ihl + 4])[0]
-        if dest_port != 57373:                 # voice only
-            return None
-        udp_payload = ip_frame[ihl + 8:]
-        if len(udp_payload) < 12:               # need RTP header + payload
-            return None
-        return st.decoder.decode_opus(udp_payload[12:])   # strip 12-byte RTP
+        return dest_port, ip_frame[ihl + 8:]
 
     def _status_loop(self):
         while self.running:

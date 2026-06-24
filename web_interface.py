@@ -720,6 +720,27 @@ class EnhancedRadioWebInterface:
 			return
 		await self.broadcast_to_all({"type": "mix_state", "data": mix.roster()})
 
+	def _setup_mix_text_bridge(self, loop):
+		"""Route text from the mixer (which runs in its own thread) into the chat.
+		Text isn't mixed — every message is shown, tagged by callsign."""
+		mix = self._mix_receiver()
+		if not mix:
+			return
+		def cb(callsign, text):
+			try:
+				asyncio.run_coroutine_threadsafe(
+					self._display_mix_text(callsign, text), loop)
+			except Exception:
+				pass
+		mix.text_callback = cb
+
+	async def _display_mix_text(self, callsign, text):
+		"""Show a mixed-station text message in the chat (same path as normal RX text)."""
+		await self.on_message_received({
+			'type': 'text', 'content': text, 'from': callsign,
+			'timestamp': datetime.now().isoformat(), 'direction': 'incoming',
+		})
+
 	async def handle_mix_record(self, data: Dict):
 		"""Start/stop recording the mix. On stop, push a `mix_recording` message
 		so the GUI drops a playback bubble into the chat."""
@@ -2527,6 +2548,7 @@ async def _start_mix_state_loop():
 	"""Background tasks: push the Active Mix roster (~4 Hz) and auto-finalize
 	transmissions that go silent without a PTT_STOP boundary."""
 	if web_interface:
+		web_interface._setup_mix_text_bridge(asyncio.get_running_loop())
 		asyncio.create_task(web_interface.mix_state_loop())
 		asyncio.create_task(web_interface.transmission_watchdog())
 

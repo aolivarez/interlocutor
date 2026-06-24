@@ -2048,6 +2048,35 @@ if __name__ == "__main__":
 			)
 			sys.exit(0)
 
+		# One-shot text transmit: send a text message from this station and exit
+		# (no mic/PTT). Like --audio-file, but for text — for testing chat/mixer.
+		if getattr(config, 'send_text', None):
+			msg = config.send_text
+			print(f"📝 {station_id} sending text: {msg!r} -> "
+			      f"{config.network.target_ip}:{config.network.target_port}")
+			protocol = OpulentVoiceProtocolWithIP(station_id, dest_ip=config.network.target_ip)
+			transmitter = NetworkTransmitter(NetworkTransmitter.ENCAP_MODE_UDP,
+			                                 config.network.target_ip,
+			                                 config.network.target_port)
+			frame_manager = AudioDrivenFrameManager(station_id, protocol, transmitter, config)
+			frame_manager.queue_text_message(msg)
+			# Drain the text/control queues at the 40 ms cadence (one frame/cycle).
+			deadline = time.time() + 5.0
+			while time.time() < deadline:
+				frame_manager.process_nonvoice_and_transmit(time.time())
+				if frame_manager.text_queue.empty() and frame_manager.control_queue.empty():
+					break
+				time.sleep(0.04)
+			for _ in range(2):                      # small flush margin
+				frame_manager.process_nonvoice_and_transmit(time.time())
+				time.sleep(0.04)
+			try:
+				transmitter.close()
+			except Exception:
+				pass
+			print("📝 text sent")
+			sys.exit(0)
+
 		# Monitor-only mode: pure listener -- run the single-channel receiver and
 		# the multi-station mix receiver with NO microphone/PTT/TX. Lets a station
 		# without a mic monitor the band; no audio devices are required (received-
@@ -2073,6 +2102,7 @@ if __name__ == "__main__":
 				mix = MultiStationReceiver(
 					listen_port=config.network.mix_port,
 					max_talkers=getattr(config.network, 'mix_max_talkers', 4))
+				mix.text_callback = lambda cs, t: print(f"📨 [{cs}] {t}")
 				mix.start()
 			print(f"👂 Listen {config.network.listen_port}"
 			      f"{f' | 🎚️  mix {config.network.mix_port}' if mix else ''} — Ctrl+C to stop")
