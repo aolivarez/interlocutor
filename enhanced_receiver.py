@@ -9,9 +9,16 @@ import time
 import struct
 import json
 import socket
+import math
+import wave
 import pyaudio
 import logging
+from collections import deque
 from queue import Queue, Empty
+try:
+    import audioop                     # stdlib (removed in Python 3.13)
+except Exception:
+    audioop = None
 from typing import Optional, Dict, List, Callable
 from datetime import datetime
 
@@ -1137,8 +1144,21 @@ class _StationStream:
         self.cobs_manager = COBSFrameBoundaryManager()
         self.decoder = AudioDecoder()
         self.voice_frames = 0
-        self.last_pcm = None          # most recent decoded PCM (for step-2 mixer)
+        self.last_pcm = None          # most recent decoded PCM
         self.last_seen = time.time()
+        # --- mixer state (step 2) ---
+        self.pcm_queue = deque(maxlen=16)   # decoded 40 ms PCM frames awaiting mix
+        self.gain = 1.0                     # per-station gain (UI later)
+        self.muted = False                  # per-station mute (UI later)
+        self.pan = 0.0                      # -1 = hard left .. +1 = hard right
+        self.pan_gains = (0.707, 0.707)     # (left, right) constant-power weights
+
+    def set_pan(self, pan):
+        """Constant-power pan: pan -1..+1 -> (left,right) gains. Center = -3 dB
+        each side so a centered talker doesn't sum hotter than a panned one."""
+        self.pan = max(-1.0, min(1.0, pan))
+        theta = (self.pan + 1.0) * math.pi / 4.0   # -1->0, 0->pi/4, +1->pi/2
+        self.pan_gains = (math.cos(theta), math.sin(theta))
 
 
 class MultiStationReceiver:
@@ -1149,17 +1169,35 @@ class MultiStationReceiver:
     --audio-file transmitters can be pointed straight at this port for testing.
     """
     ACTIVE_TIMEOUT_S = 2.0            # silence after which a station is "gone"
+    SAMPLE_RATE = 48000
+    FRAME_SAMPLES = 1920             # 40 ms
+    MASTER_GAIN = 0.7               # headroom so a few summed talkers don't clip
+    # Pan slots assigned in join order, ordered for maximum separation as
+    # stations arrive (first two hard L/R, then centre, then wider, ...).
+    PAN_SLOTS = (-0.8, 0.8, 0.0, -1.0, 1.0, -0.4, 0.4)
 
-    def __init__(self, listen_port=7091, status_interval=1.0):
+    def __init__(self, listen_port=7091, status_interval=1.0,
+                 play=True, record_path=None):
         self.listen_port = listen_port
         self.status_interval = status_interval
+        self.play = play                # open a stereo output device for the mix
+        self.record_path = record_path  # also write the mixed stereo to this WAV
         self.socket = None
         self.running = False
         self.receive_thread = None
         self.status_thread = None
+        self.mix_thread = None
         self.lock = threading.Lock()
         self.stations = {}           # station_bytes -> _StationStream
+        self._pan_idx = 0
         self.stats = {'datagrams': 0, 'voice_frames': 0, 'decode_errors': 0}
+        # mix output state
+        self._pa = None
+        self.out_stream = None
+        self.wav = None
+        self._mono_bytes = self.FRAME_SAMPLES * 2          # 3840
+        self._silence_mono = b'\x00' * self._mono_bytes
+        self._silence_stereo = b'\x00' * (self._mono_bytes * 2)   # 7680
 
     def start(self):
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -1172,11 +1210,57 @@ class MultiStationReceiver:
         self.status_thread = threading.Thread(target=self._status_loop, daemon=True)
         self.status_thread.start()
         print(f"🎚️  Multi-station MIX receiver listening on port {self.listen_port}")
+        self._start_mix_output()
+
+    def _start_mix_output(self):
+        if audioop is None:
+            print("🎚️  audioop unavailable — mix demux only (no stereo output)")
+            return
+        if self.play:
+            try:
+                self._pa = pyaudio.PyAudio()
+                self.out_stream = self._pa.open(
+                    format=pyaudio.paInt16, channels=2, rate=self.SAMPLE_RATE,
+                    output=True, frames_per_buffer=self.FRAME_SAMPLES)
+                print("🎚️  stereo mix output open (default device)")
+            except Exception as e:
+                print(f"🎚️  no stereo output device ({e}) — mix not played"
+                      + (" (recording only)" if self.record_path else ""))
+                self.out_stream = None
+        if self.record_path:
+            try:
+                self.wav = wave.open(self.record_path, 'wb')
+                self.wav.setnchannels(2); self.wav.setsampwidth(2)
+                self.wav.setframerate(self.SAMPLE_RATE)
+                print(f"🎚️  recording mix to {self.record_path}")
+            except Exception as e:
+                print(f"🎚️  could not open record file: {e}")
+                self.wav = None
+        if self.out_stream is not None or self.wav is not None:
+            self.mix_thread = threading.Thread(target=self._mix_loop, daemon=True)
+            self.mix_thread.start()
 
     def stop(self):
         self.running = False
         if self.receive_thread:
             self.receive_thread.join(timeout=2.0)
+        if self.mix_thread:
+            self.mix_thread.join(timeout=2.0)
+        if self.out_stream:
+            try:
+                self.out_stream.stop_stream(); self.out_stream.close()
+            except Exception:
+                pass
+        if self._pa:
+            try:
+                self._pa.terminate()
+            except Exception:
+                pass
+        if self.wav:
+            try:
+                self.wav.close()
+            except Exception:
+                pass
         if self.socket:
             self.socket.close()
         print("🎚️  Multi-station MIX receiver stopped")
@@ -1222,8 +1306,10 @@ class MultiStationReceiver:
             st = self.stations.get(station_bytes)
             if st is None:
                 st = _StationStream(station_bytes)
+                st.set_pan(self.PAN_SLOTS[self._pan_idx % len(self.PAN_SLOTS)])
+                self._pan_idx += 1
                 self.stations[station_bytes] = st
-                print(f"🎚️  + {st.callsign} joined mix "
+                print(f"🎚️  + {st.callsign} joined mix @ pan {st.pan:+.1f} "
                       f"({len(self.stations)} station(s) seen)")
             st.last_seen = time.time()
 
@@ -1237,6 +1323,7 @@ class MultiStationReceiver:
             pcm = self._decode_voice(st, ip_frame)
             if pcm:
                 st.last_pcm = pcm
+                st.pcm_queue.append(pcm)        # hand to the mixer
                 st.voice_frames += 1
                 self.stats['voice_frames'] += 1
 
@@ -1267,6 +1354,55 @@ class MultiStationReceiver:
             if active:
                 summary = ", ".join(f"{c}({n})" for c, n in sorted(active))
                 print(f"🎚️  active [{len(active)}]: {summary}")
+
+    # ----- step 2: stereo mixer -----
+    def _mix_one_frame(self):
+        """Pull one 40 ms PCM frame from each active, un-muted station; pan +
+        sum into a single 40 ms interleaved-stereo frame (saturating)."""
+        now = time.time()
+        with self.lock:
+            live = [s for s in self.stations.values()
+                    if now - s.last_seen < self.ACTIVE_TIMEOUT_S and not s.muted]
+        acc = None
+        for st in live:
+            frame = st.pcm_queue.popleft() if st.pcm_queue else None
+            if not frame:
+                continue                       # this station has no audio this tick
+            if len(frame) != self._mono_bytes:
+                frame = (frame + self._silence_mono)[:self._mono_bytes]
+            lg, rg = st.pan_gains
+            g = st.gain * self.MASTER_GAIN
+            stereo = audioop.tostereo(frame, 2, lg * g, rg * g)   # pan
+            acc = stereo if acc is None else audioop.add(acc, stereo, 2)  # sum
+        return acc if acc is not None else self._silence_stereo
+
+    def _mix_loop(self):
+        """40 ms mix clock. Paced by the blocking device write when a device is
+        open; otherwise (record-only) paced by the wall clock."""
+        print("🎚️  mixer running")
+        frame_dt = self.FRAME_SAMPLES / float(self.SAMPLE_RATE)   # 0.04 s
+        next_t = time.time()
+        while self.running:
+            out = self._mix_one_frame()
+            paced = False
+            if self.out_stream is not None:
+                try:
+                    self.out_stream.write(out)   # blocks -> paces at device rate
+                    paced = True
+                except Exception as e:
+                    DebugConfig.debug_print(f"🎚️  mix write error: {e}")
+            if self.wav is not None:
+                try:
+                    self.wav.writeframes(out)
+                except Exception:
+                    pass
+            if not paced:
+                next_t += frame_dt
+                delay = next_t - time.time()
+                if delay > 0:
+                    time.sleep(delay)
+                else:
+                    next_t = time.time()
 
 
 # Integration functions for existing code
@@ -1306,10 +1442,14 @@ def integrate_enhanced_receiver(radio_system, web_interface=None):
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import argparse
-    ap = argparse.ArgumentParser(description="OPV multi-station MIX receiver (step 1)")
+    ap = argparse.ArgumentParser(description="OPV multi-station MIX receiver + mixer")
     ap.add_argument("--mix-port", type=int, default=7091, help="UDP mix port (default 7091)")
+    ap.add_argument("--no-play", action="store_true", help="don't open an output device")
+    ap.add_argument("--mix-record", metavar="WAV", default=None,
+                    help="also write the mixed stereo to a WAV (headless-safe)")
     a = ap.parse_args()
-    rx = MultiStationReceiver(listen_port=a.mix_port)
+    rx = MultiStationReceiver(listen_port=a.mix_port, play=not a.no_play,
+                              record_path=a.mix_record)
     rx.start()
     print("🎚️  Ctrl+C to stop")
     try:
