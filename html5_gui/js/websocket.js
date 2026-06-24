@@ -212,6 +212,10 @@ function handleWebSocketMessage(message) {
 			if (typeof renderMixBubble === 'function') renderMixBubble(message.data);
 			break;
 
+		case 'mix_recording':
+			if (typeof addMixRecordingBubble === 'function') addMixRecordingBubble(message.data);
+			break;
+
 		case 'error':
 			showNotification(message.message || 'An error occurred', 'error');
 			addLogEntry(`Error: ${message.message}`, 'error');

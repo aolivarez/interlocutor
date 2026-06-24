@@ -876,6 +876,8 @@ function renderMixBubble(data) {
 		return;
 	}
 	bubble.hidden = false;
+	_bindMixRecBtn();
+	_updateMixRecBtn(data.recording);
 
 	var present = {}, audible = 0;
 	stations.forEach(function (st) {
@@ -891,4 +893,48 @@ function renderMixBubble(data) {
 
 	var cap = data.max_talkers ? (' · cap ' + data.max_talkers) : '';
 	summary.textContent = stations.length + ' active · ' + audible + ' audible' + cap;
+}
+
+
+// ===== Active Mix: record button + recording playback bubble =====
+var _mixRecording = false;
+
+function _bindMixRecBtn() {
+	var btn = document.getElementById('mix-rec-btn');
+	if (!btn || btn._bound) return;
+	btn._bound = true;
+	btn.addEventListener('click', function () {
+		if (typeof sendWebSocketMessage === 'function') {
+			sendWebSocketMessage('mix_record', { action: _mixRecording ? 'stop' : 'start' });
+		}
+	});
+}
+
+function _updateMixRecBtn(recording) {
+	_mixRecording = !!recording;
+	var btn = document.getElementById('mix-rec-btn');
+	if (!btn) return;
+	btn.classList.toggle('recording', _mixRecording);
+	btn.textContent = _mixRecording ? '■ Stop' : '● Rec';
+}
+
+// Drop a playback bubble into the chat for a finished mix recording.
+function addMixRecordingBubble(data) {
+	var history = document.getElementById('message-history');
+	if (!history || !data) return;
+	var el = document.createElement('div');
+	el.className = 'message system mix-recording';
+
+	var label = document.createElement('div');
+	label.className = 'mix-recording-label';
+	var calls = (data.callsigns || []).join(', ') || 'mix';
+	label.textContent = '🎚 Mix recording — ' + calls + ' (' + data.duration_s + 's)';
+
+	var audio = document.createElement('audio');
+	audio.controls = true; audio.preload = 'none'; audio.src = data.url;
+	audio.style.width = '100%';
+
+	el.appendChild(label); el.appendChild(audio);
+	history.appendChild(el);
+	history.scrollTop = history.scrollHeight;
 }

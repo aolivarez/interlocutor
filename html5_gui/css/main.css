@@ -935,3 +935,22 @@ body {
 .mix-solo.on { background: #5a4a14; border-color: #ffd24a; color: #ffe9a8; }
 
 .mix-gain { width: 7rem; }
+
+/* Active Mix: record button + recording playback bubble */
+.mix-bubble-head { gap: 0.5rem; }
+.mix-rec-btn {
+	margin-left: auto;
+	border: 1px solid rgba(255, 107, 107, 0.5);
+	background: transparent; color: #ff9b9b;
+	border-radius: 6px; padding: 0.15rem 0.5rem; cursor: pointer;
+	font-weight: 700; font-size: 0.8rem; white-space: nowrap;
+}
+.mix-rec-btn.recording {
+	background: #5a1f1f; color: #ffd0d0; border-color: #ff6b6b;
+	animation: mixRecPulse 1.2s ease-in-out infinite;
+}
+@keyframes mixRecPulse { 50% { opacity: 0.55; } }
+
+.message.mix-recording { border-left: 3px solid #ff6b6b; }
+.mix-recording-label { font-weight: 600; margin-bottom: 0.3rem; }
+.message.mix-recording audio { margin-top: 0.2rem; }

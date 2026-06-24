@@ -126,10 +126,12 @@ class EnhancedRadioWebInterface:
 			'start_time': start_time,
 			'audio_packets': [],
 			'total_duration_ms': 0,
-			'packet_count': 0
+			'packet_count': 0,
+			'last_audio_at': time.time(),   # for the silence-based auto-finalize
 		}
-		
+
 		DebugConfig.debug_print(f"📡 TRANSMISSION START: {transmission_id} from {station_id}")
+		return transmission_id
 
 
 
@@ -475,6 +477,9 @@ class EnhancedRadioWebInterface:
 	async def on_audio_received(self, audio_data: Dict):
 		"""Handle received audio data - now handles both incoming AND outgoing"""
 		try:
+			# Mixed mode: no per-transmission chat bubbles (use the mix Record button)
+			if self._mix_active():
+				return
 			station_id = audio_data.get('from_station', 'UNKNOWN')
 			timestamp = audio_data.get('timestamp', datetime.now().isoformat())
 			direction = audio_data.get('direction', 'incoming')  # NEW: Check direction
@@ -571,6 +576,9 @@ class EnhancedRadioWebInterface:
 	async def on_control_received(self, control_data: Dict):
 		"""Handle received control messages - especially PTT boundaries for transmission grouping"""
 		try:
+			# Mixed mode: suppress transmission-boundary bubbles
+			if self._mix_active():
+				return
 			control_msg = control_data.get('content', '')
 			from_station = control_data.get('from', 'UNKNOWN')
 			timestamp = control_data.get('timestamp', datetime.now().isoformat())
@@ -644,6 +652,13 @@ class EnhancedRadioWebInterface:
 		"""The multi-station mixer, if running (web/full-CLI start it on the radio)."""
 		return getattr(self.radio_system, 'mix_receiver', None)
 
+	def _mix_active(self):
+		"""True when the mixer has active stations (we're in mixed mode). In that
+		state the per-transmission chat bubbles are suppressed — the operator
+		records the mix explicitly via the Record button instead."""
+		mix = self._mix_receiver()
+		return bool(mix and mix.active_stations())
+
 	async def handle_mix_control(self, data: Dict):
 		"""Apply a per-station mute/solo/gain from the Active Mix bubble, then
 		push a fresh roster so every client updates immediately."""
@@ -667,6 +682,37 @@ class EnhancedRadioWebInterface:
 		if not mix:
 			return
 		await self.broadcast_to_all({"type": "mix_state", "data": mix.roster()})
+
+	async def handle_mix_record(self, data: Dict):
+		"""Start/stop recording the mix. On stop, push a `mix_recording` message
+		so the GUI drops a playback bubble into the chat."""
+		mix = self._mix_receiver()
+		if not mix:
+			return
+		action = (data or {}).get('action')
+		if action == 'start':
+			MIX_RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+			name = f"mix_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
+			calls = mix.active_stations()
+			if mix.start_recording(str(MIX_RECORDINGS_DIR / name)):
+				self._mix_rec_meta = {'name': name, 'calls': calls,
+				                      'started': datetime.now().isoformat()}
+			await self.broadcast_mix_state()
+		elif action == 'stop':
+			info = mix.stop_recording()
+			await self.broadcast_mix_state()
+			if info:
+				meta = getattr(self, '_mix_rec_meta', {}) or {}
+				name = meta.get('name') or Path(info['path']).name
+				await self.broadcast_to_all({
+					"type": "mix_recording",
+					"data": {
+						"url": f"/recordings/{name}",
+						"callsigns": meta.get('calls', []),
+						"duration_s": info['duration_s'],
+						"timestamp": datetime.now().isoformat(),
+					},
+				})
 
 	async def mix_state_loop(self, interval: float = 0.25):
 		"""Periodic Active Mix roster push (~4 Hz) so the bubble stays live."""
@@ -1198,6 +1244,8 @@ class EnhancedRadioWebInterface:
 			# Multi-station mixer: per-station mute/solo/gain from the Active Mix bubble
 			elif command == 'mix_control':
 				await self.handle_mix_control(data)
+			elif command == 'mix_record':
+				await self.handle_mix_record(data)
 
 			else:
 				self.logger.warning(f"Unknown command: {command}")
@@ -2412,6 +2460,29 @@ class EnhancedRadioWebInterface:
 
 # FastAPI application setup
 app = FastAPI(title="Opulent Voice Web Interface", version="1.0.0")
+
+# Where mix recordings are written and served from
+MIX_RECORDINGS_DIR = Path("recordings")
+
+
+@app.get("/recordings/{name}")
+async def get_recording(name: str):
+	"""Serve a mix recording WAV for the chat playback bubble."""
+	safe = Path(name).name                      # no path traversal
+	p = MIX_RECORDINGS_DIR / safe
+	if not p.exists():
+		raise HTTPException(status_code=404, detail="recording not found")
+	return FileResponse(str(p), media_type="audio/wav")
+
+
+@app.middleware("http")
+async def _no_cache_static(request, call_next):
+	"""Don't let the browser cache the GUI assets — during dev a normal reload
+	should always pick up the latest JS/CSS/HTML (e.g. the Active Mix bubble)."""
+	response = await call_next(request)
+	if request.url.path.startswith("/static") or request.url.path in ("/", ""):
+		response.headers["Cache-Control"] = "no-store, max-age=0"
+	return response
 
 
 @app.on_event("startup")

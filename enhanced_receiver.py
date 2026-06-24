@@ -1198,6 +1198,7 @@ class MultiStationReceiver:
         self._pa = None
         self.out_stream = None
         self.wav = None
+        self._rec_path = None
         self._mono_bytes = self.FRAME_SAMPLES * 2          # 3840
         self._silence_mono = b'\x00' * self._mono_bytes
         self._silence_stereo = b'\x00' * (self._mono_bytes * 2)   # 7680
@@ -1239,9 +1240,50 @@ class MultiStationReceiver:
             except Exception as e:
                 print(f"🎚️  could not open record file: {e}")
                 self.wav = None
-        if self.out_stream is not None or self.wav is not None:
-            self.mix_thread = threading.Thread(target=self._mix_loop, daemon=True)
-            self.mix_thread.start()
+        # Always run the mix loop (so on-demand recording can start any time);
+        # it writes to whatever sinks are present and paces by the wall clock
+        # when there's no blocking output device.
+        self.mix_thread = threading.Thread(target=self._mix_loop, daemon=True)
+        self.mix_thread.start()
+
+    def start_recording(self, path):
+        """Begin writing the mixed stereo to a WAV. Returns True if it started."""
+        with self.lock:
+            if self.wav is not None:
+                return False
+            try:
+                w = wave.open(path, 'wb')
+                w.setnchannels(2); w.setsampwidth(2); w.setframerate(self.SAMPLE_RATE)
+            except Exception as e:
+                print(f"🎚️  could not start recording: {e}")
+                return False
+            self.wav = w
+            self._rec_path = path
+        print(f"🎚️  ● recording mix -> {path}")
+        return True
+
+    def stop_recording(self):
+        """Finalize the current recording. Returns {path, duration_s} or None."""
+        with self.lock:
+            if self.wav is None:
+                return None
+            w, path = self.wav, self._rec_path
+            self.wav = None
+            try:
+                frames = w.getnframes()
+            except Exception:
+                frames = 0
+            try:
+                w.close()
+            except Exception:
+                pass
+        dur = round(frames / float(self.SAMPLE_RATE), 1)
+        print(f"🎚️  ■ recording stopped -> {path} ({dur}s)")
+        return {'path': path, 'duration_s': dur}
+
+    def is_recording(self):
+        with self.lock:
+            return self.wav is not None
 
     def stop(self):
         self.running = False
@@ -1287,6 +1329,7 @@ class MultiStationReceiver:
             active.sort(key=lambda s: s.started_at, reverse=True)
             return {
                 'max_talkers': self.max_talkers,
+                'recording': self.wav is not None,
                 'stations': [{
                     'callsign': s.callsign,
                     'pan': round(s.pan, 2),
