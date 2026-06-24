@@ -529,25 +529,23 @@ class EnhancedRadioWebInterface:
 
 
 			else:
-				# INCOMING: Use existing logic (unchanged)
-				if station_id in self.active_transmissions:
-					transmission = self.active_transmissions[station_id]
-					transmission['audio_packets'].append(audio_packet)
-					transmission['packet_count'] += 1
-					transmission['total_duration_ms'] += audio_data.get('duration_ms', 40)
+				# INCOMING
+				if station_id not in self.active_transmissions:
+					# No PTT_START seen (dashboard toggled on mid-message) -> auto-start
+					# so the audio is grouped into a real, playable transmission.
+					await self._begin_transmission(station_id, timestamp)
+				transmission = self.active_transmissions[station_id]
+				transmission['audio_packets'].append(audio_packet)
+				transmission['packet_count'] += 1
+				transmission['total_duration_ms'] += audio_data.get('duration_ms', 40)
+				transmission['last_audio_at'] = time.time()   # feeds the silence watchdog
+				# keep the live buffer fed for real-time playback too
+				self.live_audio_packets[audio_packet['audio_id']] = audio_packet
+				if len(self.live_audio_packets) > self.max_live_packets:
+					del self.live_audio_packets[min(self.live_audio_packets.keys())]
+				DebugConfig.debug_print(f"📡 INCOMING AUDIO: {transmission['transmission_id']} "
+					f"({transmission['packet_count']} packets)")
         
-					DebugConfig.debug_print(f"📡 INCOMING AUDIO: Added packet to {transmission['transmission_id']} "
-						f"({transmission['packet_count']} packets)")
-				else:
-					# No active transmission - add to live buffer for real-time audio
-					self.live_audio_packets[audio_packet['audio_id']] = audio_packet
-        
-					# Cleanup live buffer
-					if len(self.live_audio_packets) > self.max_live_packets:
-						oldest_id = min(self.live_audio_packets.keys())
-						del self.live_audio_packets[oldest_id]
-        
-					DebugConfig.debug_print(f"🔊 LIVE AUDIO: Added packet to live buffer ({len(self.live_audio_packets)} packets)")
     
 				# Broadcast to web clients (existing notification)
 				await self.broadcast_to_all({
@@ -658,6 +656,45 @@ class EnhancedRadioWebInterface:
 		records the mix explicitly via the Record button instead."""
 		mix = self._mix_receiver()
 		return bool(mix and mix.active_stations())
+
+	async def _begin_transmission(self, station_id, ts):
+		"""Start a transmission and announce it (used by PTT_START and by the
+		audio auto-start when the dashboard is toggled on mid-message)."""
+		tx_id = self.start_transmission(station_id, ts)
+		await self.broadcast_to_all({
+			"type": "transmission_started",
+			"data": {"station_id": station_id, "transmission_id": tx_id, "start_time": ts},
+		})
+		return tx_id
+
+	async def _finish_transmission(self, station_id, ts):
+		"""End a transmission and announce it (used by PTT_STOP and by the silence
+		watchdog when the PTT_STOP boundary frame is never received)."""
+		tx = self.active_transmissions.get(station_id)
+		if not tx:
+			return
+		tx_id = tx['transmission_id']
+		self.end_transmission(station_id, ts)
+		await self.broadcast_to_all({
+			"type": "transmission_ended",
+			"data": {"station_id": station_id, "transmission_id": tx_id, "end_time": ts},
+		})
+
+	async def transmission_watchdog(self, timeout=1.5, interval=0.5):
+		"""Auto-finalize incoming transmissions that stop receiving audio (e.g. the
+		dashboard selection was toggled off mid-message, so PTT_STOP never came).
+		Without this the bubble stays 'in progress' forever and never plays back."""
+		while True:
+			try:
+				now = time.time()
+				stale = [sid for sid, tx in list(self.active_transmissions.items())
+				         if now - tx.get('last_audio_at', now) > timeout]
+				for sid in stale:
+					DebugConfig.debug_print(f"⏱️ auto-finalizing idle transmission from {sid}")
+					await self._finish_transmission(sid, datetime.now().isoformat())
+			except Exception as e:
+				DebugConfig.debug_print(f"transmission_watchdog error: {e}")
+			await asyncio.sleep(interval)
 
 	async def handle_mix_control(self, data: Dict):
 		"""Apply a per-station mute/solo/gain from the Active Mix bubble, then
@@ -2487,9 +2524,11 @@ async def _no_cache_static(request, call_next):
 
 @app.on_event("startup")
 async def _start_mix_state_loop():
-	"""Background task: push the Active Mix roster to clients ~4 Hz."""
+	"""Background tasks: push the Active Mix roster (~4 Hz) and auto-finalize
+	transmissions that go silent without a PTT_STOP boundary."""
 	if web_interface:
 		asyncio.create_task(web_interface.mix_state_loop())
+		asyncio.create_task(web_interface.transmission_watchdog())
 
 # Add CORS middleware for development
 app.add_middleware(
