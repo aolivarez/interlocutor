@@ -1115,6 +1115,160 @@ class AudioDecoder:
             return None
 
 
+# ---------------------------------------------------------------------------
+# Multi-station monitor / mixer — STEP 1: bind the dedicated MIX port, demux
+# incoming OPV frames by station, and decode each station with its OWN pipeline.
+# No mixing / audio output yet (steps 2+). This proves N concurrent stations
+# land in N independent decoders. See multi_station_monitor_design.md.
+# ---------------------------------------------------------------------------
+class _StationStream:
+    """Per-station decode pipeline. Each station gets its own reassembler, COBS
+    manager, and Opus decoder, because all three are stateful per stream —
+    sharing them (as the single-channel path does) corrupts state when streams
+    interleave. Holds the latest decoded 40 ms PCM for the mixer (step 2)."""
+
+    def __init__(self, station_bytes):
+        self.station_bytes = station_bytes
+        try:
+            self.callsign = str(StationIdentifier.from_bytes(station_bytes))
+        except Exception:
+            self.callsign = f"UNKNOWN-{station_bytes.hex()[:8]}"
+        self.reassembler = SimpleFrameReassembler()
+        self.cobs_manager = COBSFrameBoundaryManager()
+        self.decoder = AudioDecoder()
+        self.voice_frames = 0
+        self.last_pcm = None          # most recent decoded PCM (for step-2 mixer)
+        self.last_seen = time.time()
+
+
+class MultiStationReceiver:
+    """Receives the aggregated multi-channel feed on the dedicated MIX port and
+    demuxes it into one _StationStream per callsign. The wire format is the
+    standard 134-byte OPV frame (identical to the normal receiver), so the
+    rx-dashboard can forward selected channels here verbatim and the
+    --audio-file transmitters can be pointed straight at this port for testing.
+    """
+    ACTIVE_TIMEOUT_S = 2.0            # silence after which a station is "gone"
+
+    def __init__(self, listen_port=7091, status_interval=1.0):
+        self.listen_port = listen_port
+        self.status_interval = status_interval
+        self.socket = None
+        self.running = False
+        self.receive_thread = None
+        self.status_thread = None
+        self.lock = threading.Lock()
+        self.stations = {}           # station_bytes -> _StationStream
+        self.stats = {'datagrams': 0, 'voice_frames': 0, 'decode_errors': 0}
+
+    def start(self):
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.socket.bind(('', self.listen_port))
+        self.socket.settimeout(1.0)
+        self.running = True
+        self.receive_thread = threading.Thread(target=self._receive_loop, daemon=True)
+        self.receive_thread.start()
+        self.status_thread = threading.Thread(target=self._status_loop, daemon=True)
+        self.status_thread.start()
+        print(f"🎚️  Multi-station MIX receiver listening on port {self.listen_port}")
+
+    def stop(self):
+        self.running = False
+        if self.receive_thread:
+            self.receive_thread.join(timeout=2.0)
+        if self.socket:
+            self.socket.close()
+        print("🎚️  Multi-station MIX receiver stopped")
+
+    def active_stations(self):
+        """Callsigns seen within ACTIVE_TIMEOUT_S — the live talkers."""
+        now = time.time()
+        with self.lock:
+            return sorted(s.callsign for s in self.stations.values()
+                          if now - s.last_seen < self.ACTIVE_TIMEOUT_S)
+
+    def _receive_loop(self):
+        while self.running:
+            try:
+                data, _ = self.socket.recvfrom(4096)
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if self.running:
+                    print(f"🎚️  mix recv error: {e}")
+                continue
+            self.stats['datagrams'] += 1
+            try:
+                self._process(data)
+            except Exception as e:
+                self.stats['decode_errors'] += 1
+                DebugConfig.debug_print(f"🎚️  mix process error: {e}")
+
+    def _process(self, data):
+        # Standard 134-byte OPV frame: 12-byte header + 122-byte fragment.
+        if len(data) != 134:
+            return
+        station_bytes, token, _reserved = struct.unpack('>6s 3s 3s', data[:12])
+        if token != OpulentVoiceProtocolWithIP.TOKEN:
+            return
+        fragment_payload = data[12:]
+        if not any(fragment_payload):          # dummy/keepalive frame
+            return
+        if fragment_payload == postamble:      # end-of-burst marker
+            return
+
+        with self.lock:
+            st = self.stations.get(station_bytes)
+            if st is None:
+                st = _StationStream(station_bytes)
+                self.stations[station_bytes] = st
+                print(f"🎚️  + {st.callsign} joined mix "
+                      f"({len(self.stations)} station(s) seen)")
+            st.last_seen = time.time()
+
+        # Per-station: reassemble -> COBS-decode -> IP/UDP -> voice -> Opus.
+        for frame in st.reassembler.add_frame_payload(fragment_payload):
+            try:
+                ip_frame, _ = st.cobs_manager.decode_frame(frame)
+            except Exception:
+                self.stats['decode_errors'] += 1
+                continue
+            pcm = self._decode_voice(st, ip_frame)
+            if pcm:
+                st.last_pcm = pcm
+                st.voice_frames += 1
+                self.stats['voice_frames'] += 1
+
+    def _decode_voice(self, st, ip_frame):
+        """Pull the voice payload (encapsulated UDP dest 57373) and Opus-decode
+        it through this station's own decoder. Text/control ignored for now."""
+        if len(ip_frame) < 20:
+            return None
+        ihl = (ip_frame[0] & 0x0F) * 4
+        if len(ip_frame) < ihl + 8:
+            return None
+        dest_port = struct.unpack('!H', ip_frame[ihl + 2:ihl + 4])[0]
+        if dest_port != 57373:                 # voice only
+            return None
+        udp_payload = ip_frame[ihl + 8:]
+        if len(udp_payload) < 12:               # need RTP header + payload
+            return None
+        return st.decoder.decode_opus(udp_payload[12:])   # strip 12-byte RTP
+
+    def _status_loop(self):
+        while self.running:
+            time.sleep(self.status_interval)
+            now = time.time()
+            with self.lock:
+                active = [(s.callsign, s.voice_frames)
+                          for s in self.stations.values()
+                          if now - s.last_seen < self.ACTIVE_TIMEOUT_S]
+            if active:
+                summary = ", ".join(f"{c}({n})" for c, n in sorted(active))
+                print(f"🎚️  active [{len(active)}]: {summary}")
+
+
 # Integration functions for existing code
 def integrate_enhanced_receiver(radio_system, web_interface=None):
     """Replace existing MessageReceiver with enhanced version"""
@@ -1142,3 +1296,25 @@ def integrate_enhanced_receiver(radio_system, web_interface=None):
     
     print("🔄 Upgraded to enhanced message receiver with web integration")
     return enhanced_receiver
+
+
+# ---------------------------------------------------------------------------
+# Standalone runner for the multi-station MIX receiver (step 1).
+#   python enhanced_receiver.py [--mix-port 7091]
+# Point one or more `interlocutor.py ... --audio-file X.wav` transmitters at this
+# port to watch them demux into independent per-station decoders.
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser(description="OPV multi-station MIX receiver (step 1)")
+    ap.add_argument("--mix-port", type=int, default=7091, help="UDP mix port (default 7091)")
+    a = ap.parse_args()
+    rx = MultiStationReceiver(listen_port=a.mix_port)
+    rx.start()
+    print("🎚️  Ctrl+C to stop")
+    try:
+        while True:
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        rx.stop()
+        print(f"\nstats: {rx.stats}")

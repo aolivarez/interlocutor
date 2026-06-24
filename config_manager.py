@@ -220,6 +220,7 @@ class GUIConfig:
 class UIConfig:
 	"""User Interface configuration - extends your existing UI config"""
 	chat_only_mode: bool = False
+	monitor_only_mode: bool = False     # listen-only: receivers + mix, no mic/TX/PTT
 	web_interface_enabled: bool = False
 	web_interface_port: int = 8000
 	web_interface_host: str = "0.0.0.0"
@@ -234,6 +235,7 @@ class UIConfig:
 		"""Convert to dictionary for YAML serialization"""
 		return {
 			'chat_only_mode': self.chat_only_mode,
+			'monitor_only_mode': self.monitor_only_mode,
 			'web_interface_enabled': self.web_interface_enabled,
 			'web_interface_port': self.web_interface_port,
 			'web_interface_host': self.web_interface_host,
@@ -245,6 +247,7 @@ class UIConfig:
 		"""Create from dictionary (YAML loading)"""
 		return cls(
 			chat_only_mode=data.get('chat_only_mode', False),
+			monitor_only_mode=data.get('monitor_only_mode', False),
 			web_interface_enabled=data.get('web_interface_enabled', False),
 			web_interface_port=data.get('web_interface_port', 8000),
 			web_interface_host=data.get('web_interface_host', '0.0.0.0'),
@@ -268,6 +271,7 @@ class NetworkConfig:
 	target_ip: str = "192.168.2.152"
 	target_port: int = 57372
 	listen_port: int = 57372
+	mix_port: int = 7091                 # multi-station monitor/mixer port (0 = off)
 	encap_mode: str = "UDP"
 	target_type: str = "computer"       # "computer" or "modem" - also in protocol for compat
 	keepalive_interval: float = 2.0     # Interval for keepalive frames - also in protocol for compat
@@ -379,6 +383,7 @@ class OpulentVoiceConfig:
 				'target_ip': self.network.target_ip,
 				'target_port': self.network.target_port,
 				'listen_port': self.network.listen_port,
+				'mix_port': self.network.mix_port,
 				'encap_mode': self.network.encap_mode,
 				'target_type': self.network.target_type,
 				'keepalive_interval': self.network.keepalive_interval,
@@ -422,6 +427,7 @@ class OpulentVoiceConfig:
 			config.network.target_ip = net_data.get('target_ip', config.network.target_ip)
 			config.network.target_port = net_data.get('target_port', config.network.target_port)
 			config.network.listen_port = net_data.get('listen_port', config.network.listen_port)
+			config.network.mix_port = net_data.get('mix_port', config.network.mix_port)
 			config.network.encap_mode = net_data.get('encap_mode', config.network.encap_mode)
 			config.network.target_type = net_data.get('target_type', config.network.target_type)
 			config.network.keepalive_interval = net_data.get('keepalive_interval', config.network.keepalive_interval)
@@ -623,6 +629,8 @@ class ConfigurationManager:
 			self.config.network.target_port = args.port
 		if hasattr(args, 'listen_port') and args.listen_port:
 			self.config.network.listen_port = args.listen_port
+		if hasattr(args, 'mix_port') and args.mix_port is not None:
+			self.config.network.mix_port = args.mix_port
 		if hasattr(args, 'encap_mode') and args.encap_mode:
 			self.config.network.encap_mode = args.encap_mode
 
@@ -647,6 +655,8 @@ class ConfigurationManager:
 		# UI settings
 		if hasattr(args, 'chat_only') and args.chat_only:
 			self.config.ui.chat_only_mode = True
+		if hasattr(args, 'monitor_only') and args.monitor_only:
+			self.config.ui.monitor_only_mode = True
 
 		# Audio file transmit (fake the mic from a WAV file)
 		if hasattr(args, 'audio_file') and args.audio_file:
@@ -1238,7 +1248,14 @@ Configuration:
 		type=int,
 		help='Local port for receiving messages'
 	)
-	
+	network_group.add_argument(
+		'--mix-port',
+		type=int,
+		default=None,
+		help='Multi-station monitor/mixer port (default 7091; 0 to disable). '
+		     'The rx-dashboard forwards 2+ selected channels here.'
+	)
+
 	# GPIO settings
 	gpio_group = parser.add_argument_group('GPIO Settings (Raspberry Pi)')
 	gpio_group.add_argument(
@@ -1305,7 +1322,14 @@ Configuration:
 		action='store_true',
 		help='Run in chat-only mode (no GPIO/audio)'
 	)
-	
+	ui_group.add_argument(
+		'--monitor', '--monitor-only',
+		dest='monitor_only',
+		action='store_true',
+		help='Listen-only mode: run the receiver + multi-station mix receiver '
+		     'with no microphone/PTT/TX (for a pure monitor without a mic)'
+	)
+
 	# Debug settings
 	debug_group = parser.add_argument_group('Debug Options')
 	debug_group.add_argument(

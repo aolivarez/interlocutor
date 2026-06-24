@@ -1118,6 +1118,24 @@ class GPIOZeroPTTHandler:
 
 
 
+	def start_mix_receiver(self):
+		"""Start the multi-station monitor/mixer receiver on the mix port, if
+		enabled (network.mix_port > 0). Listens for the aggregated multi-channel
+		feed the rx-dashboard forwards when 2+ channels are selected. Step 1:
+		demux + per-station decode only (no mixed audio output yet)."""
+		port = getattr(self.config.network, 'mix_port', 0)
+		self.mix_receiver = None
+		if not port:
+			return None
+		try:
+			from enhanced_receiver import MultiStationReceiver
+			self.mix_receiver = MultiStationReceiver(listen_port=port)
+			self.mix_receiver.start()
+		except Exception as e:
+			DebugConfig.system_print(f"⚠️ Multi-station mix receiver not started: {e}")
+			self.mix_receiver = None
+		return self.mix_receiver
+
 	def setup_enhanced_receiver_for_cli(self):
 		"""Setup enhanced receiver with audio output - CLI MODE ONLY (no web interface)"""
 		try:
@@ -1764,6 +1782,9 @@ class GPIOZeroPTTHandler:
 			self.enhanced_receiver.stop_audio_output()
 			self.enhanced_receiver.stop()
 
+		if getattr(self, 'mix_receiver', None):
+			self.mix_receiver.stop()
+
 		self.transmitter.close()
 		if self.led:
 			self.led.off()
@@ -2025,6 +2046,43 @@ if __name__ == "__main__":
 			)
 			sys.exit(0)
 
+		# Monitor-only mode: pure listener -- run the single-channel receiver and
+		# the multi-station mix receiver with NO microphone/PTT/TX. Lets a station
+		# without a mic monitor the band; no audio devices are required (received-
+		# audio playback is attached only if an output device is available).
+		if hasattr(config, 'ui') and getattr(config.ui, 'monitor_only_mode', False):
+			print("📡 Monitor-only mode (no mic/TX) — listening")
+			from enhanced_receiver import EnhancedMessageReceiver, MultiStationReceiver
+			receiver = EnhancedMessageReceiver(listen_port=config.network.listen_port)
+			# best-effort received-audio playback (default output device; skip if none)
+			try:
+				from enhanced_receiver import AudioOutputManager
+				params = {'sample_rate': 48000, 'frame_duration_ms': 40,
+				          'frames_per_buffer': 1920, 'channels': 1}
+				ao = AudioOutputManager(params)
+				if ao.audio and ao.setup_with_device(None) and ao.start_playback():
+					receiver.audio_output = ao
+					print("🔊 Received-audio playback active")
+			except Exception as e:
+				DebugConfig.debug_print(f"monitor playback unavailable: {e}")
+			receiver.start()
+			mix = None
+			if config.network.mix_port:
+				mix = MultiStationReceiver(listen_port=config.network.mix_port)
+				mix.start()
+			print(f"👂 Listen {config.network.listen_port}"
+			      f"{f' | 🎚️  mix {config.network.mix_port}' if mix else ''} — Ctrl+C to stop")
+			try:
+				while True:
+					time.sleep(0.1)
+			except KeyboardInterrupt:
+				print("\n🛑 Monitor shutting down...")
+			finally:
+				receiver.stop()
+				if mix:
+					mix.stop()
+			sys.exit(0)
+
 		# Check for web interface mode first
 		if hasattr(config, 'ui') and hasattr(config.ui, 'web_interface_enabled') and config.ui.web_interface_enabled:
 			# Web Interface Mode
@@ -2111,6 +2169,7 @@ if __name__ == "__main__":
 	
 			# Start radio system
 			radio.start()
+			radio.start_mix_receiver()   # multi-station monitor/mixer (mix port)
 
 			print("🚀 Web interface starting on http://localhost:8000")
 			print("🌐 Press Ctrl+C to stop the web interface")
@@ -2266,6 +2325,7 @@ if __name__ == "__main__":
 			radio.test_network()
 			radio.test_chat()
 			radio.start()
+			radio.start_mix_receiver()   # multi-station monitor/mixer (mix port)
 
 			print(f"\n✅ {station_id} Enhanced System Ready!")
 			print("🎤 Press PTT for voice transmission (highest priority)")
