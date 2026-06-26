@@ -667,6 +667,9 @@ class ConfigurationManager:
 			self.config.audio_file = args.audio_file
 		if hasattr(args, 'loop_audio') and args.loop_audio:
 			self.config.audio_file_loop = True
+		# One-shot text transmit
+		if hasattr(args, 'text') and args.text:
+			self.config.send_text = args.text
 
 		# IMPORTANT: Always return the config object
 		return self.config
@@ -1311,6 +1314,13 @@ Configuration:
 		'--loop-audio',
 		action='store_true',
 		help='With --audio-file, loop the file continuously until Ctrl+C'
+	)
+	audio_group.add_argument(
+		'--text',
+		metavar='MESSAGE',
+		default=None,
+		help='Send a one-shot text MESSAGE from this station and exit (no mic). '
+		     'Like --audio-file but for text — handy for testing the chat / mixer.'
 	)
 
 	# Protocol settings
