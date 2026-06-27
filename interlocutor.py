@@ -113,6 +113,31 @@ from web_interface import initialize_web_interface, run_web_server
 
 from enhanced_receiver import integrate_enhanced_receiver
 
+
+def _run_web_coro(web_interface, coro):
+	"""Schedule a web_interface coroutine on its uvicorn event loop.
+
+	NEVER use asyncio.run()/new_event_loop() to call into the web interface from
+	a radio/worker thread: every broadcast goes through one shared asyncio.Lock,
+	and running it on a throwaway loop binds that lock to the throwaway loop —
+	after which every real send fails with 'bound to a different event loop'.
+	run_coroutine_threadsafe hands the coroutine to the ONE uvicorn loop; drop
+	(close the coro) if that loop isn't up yet (pre-startup = no web clients)."""
+	loop = getattr(web_interface, '_main_loop', None) if web_interface else None
+	if loop is None:
+		try:
+			coro.close()
+		except Exception:
+			pass
+		return
+	try:
+		asyncio.run_coroutine_threadsafe(coro, loop)
+	except Exception:
+		try:
+			coro.close()
+		except Exception:
+			pass
+
 from radio_protocol import (
 	COBSEncoder,
 	SimpleFrameReassembler,
@@ -1464,24 +1489,13 @@ class GPIOZeroPTTHandler:
 		# NEW: Start tracking our own outgoing transmission for web interface
 		if hasattr(self, 'enhanced_receiver') and self.enhanced_receiver and hasattr(self.enhanced_receiver, 'web_bridge'):
 			try:
-				# Create outgoing transmission tracking
-				def notify_outgoing_start():
-					try:
-						loop = asyncio.new_event_loop()
-						asyncio.set_event_loop(loop)
-						loop.run_until_complete(
-							self.enhanced_receiver.web_bridge.notify_outgoing_transmission_started({
-								"station_id": str(self.station_id),
-								"start_time": datetime.now().isoformat(),
-								"direction": "outgoing"
-							})
-						)
-						loop.close()
-					except Exception as e:
-						DebugConfig.debug_print(f"Error notifying outgoing start: {e}")
-            
-				# Run in separate thread to avoid blocking audio
-				threading.Thread(target=notify_outgoing_start, daemon=True).start()
+				# Track outgoing transmission start on the web interface's loop
+				_run_web_coro(getattr(self.enhanced_receiver.web_bridge, 'web_interface', None),
+					self.enhanced_receiver.web_bridge.notify_outgoing_transmission_started({
+						"station_id": str(self.station_id),
+						"start_time": datetime.now().isoformat(),
+						"direction": "outgoing"
+					}))
 				DebugConfig.debug_print(f"📤 Started tracking outgoing transmission")
 			except Exception as e:
 				DebugConfig.debug_print(f"Error starting outgoing transmission tracking: {e}")
@@ -1505,24 +1519,13 @@ class GPIOZeroPTTHandler:
 		# NEW: End tracking our own outgoing transmission for web interface
 		if hasattr(self, 'enhanced_receiver') and self.enhanced_receiver and hasattr(self.enhanced_receiver, 'web_bridge'):
 			try:
-				# Create outgoing transmission end tracking
-				def notify_outgoing_end():
-					try:
-						loop = asyncio.new_event_loop()
-						asyncio.set_event_loop(loop)
-						loop.run_until_complete(
-							self.enhanced_receiver.web_bridge.notify_outgoing_transmission_ended({
-								"station_id": str(self.station_id),
-								"end_time": datetime.now().isoformat(),
-								"direction": "outgoing"
-							})
-						)
-						loop.close()
-					except Exception as e:
-						DebugConfig.debug_print(f"Error notifying outgoing end: {e}")
-            
-				# Run in separate thread to avoid blocking audio
-				threading.Thread(target=notify_outgoing_end, daemon=True).start()
+				# Track outgoing transmission end on the web interface's loop
+				_run_web_coro(getattr(self.enhanced_receiver.web_bridge, 'web_interface', None),
+					self.enhanced_receiver.web_bridge.notify_outgoing_transmission_ended({
+						"station_id": str(self.station_id),
+						"end_time": datetime.now().isoformat(),
+						"direction": "outgoing"
+					}))
 				DebugConfig.debug_print(f"📤 Ended tracking outgoing transmission")
 			except Exception as e:
 				DebugConfig.debug_print(f"Error ending outgoing transmission tracking: {e}")
@@ -1591,20 +1594,9 @@ class GPIOZeroPTTHandler:
 						'direction': 'outgoing'
 					}
 	
-					# Send to web interface asynchronously (doesn't block audio)
-					def notify_web():
-						try:
-							loop = asyncio.new_event_loop()
-							asyncio.set_event_loop(loop)
-							loop.run_until_complete(
-								self.enhanced_receiver.web_bridge.notify_audio_received(audio_data)
-							)
-							loop.close()
-						except Exception as e:
-							DebugConfig.debug_print(f"Web outgoing audio notification error: {e}")
-	
-					# Run in separate thread to avoid blocking audio callback
-					threading.Thread(target=notify_web, daemon=True).start()
+					# Send to web interface on its own loop (doesn't block audio)
+					_run_web_coro(getattr(self.enhanced_receiver.web_bridge, 'web_interface', None),
+						self.enhanced_receiver.web_bridge.notify_audio_received(audio_data))
 					DebugConfig.debug_print(f"📤 Captured outgoing audio: {len(opus_packet)}B OPUS → {len(audio_pcm)}B PCM")
 				else:
 					DebugConfig.debug_print(f"⚠️ OPUS decode failed for outgoing audio")
@@ -1908,34 +1900,13 @@ def setup_web_interface_callbacks(radio_system, web_interface):
 			# Call original display for terminal
 			original_display(from_station, message)
 			
-			# Also send to web interface asynchronously
+			# Also send to web interface on its own loop (thread-safe)
 			if web_interface:
-				# Create a task to handle the async call
-				loop = None
-				try:
-					loop = asyncio.get_event_loop()
-				except RuntimeError:
-					# No event loop in current thread, create one
-					pass
-				
-				if loop and loop.is_running():
-					# Schedule the coroutine to run
-					asyncio.create_task(web_interface.on_message_received({
-						"content": message,
-						"from": str(from_station),
-						"type": "text"
-					}))
-				else:
-					# Handle in a thread-safe way
-					def run_async():
-						asyncio.run(web_interface.on_message_received({
-							"content": message,
-							"from": str(from_station),
-							"type": "text"
-						}))
-					
-					# Run in a separate thread to avoid blocking
-					threading.Thread(target=run_async, daemon=True).start()
+				_run_web_coro(web_interface, web_interface.on_message_received({
+					"content": message,
+					"from": str(from_station),
+					"type": "text"
+				}))
 		
 		# Replace the method
 		radio_system.chat_interface.display_received_message = enhanced_display
@@ -1948,19 +1919,13 @@ def setup_web_interface_callbacks(radio_system, web_interface):
 		# Create thread-safe PTT wrappers
 		def ptt_pressed_with_web():
 			original_ptt_pressed()
-			# Notify web interface in thread-safe way
 			if web_interface:
-				def notify_web():
-					asyncio.run(web_interface.on_ptt_state_changed(True))
-				threading.Thread(target=notify_web, daemon=True).start()
-		
+				_run_web_coro(web_interface, web_interface.on_ptt_state_changed(True))
+
 		def ptt_released_with_web():
 			original_ptt_released()
-			# Notify web interface in thread-safe way
 			if web_interface:
-				def notify_web():
-					asyncio.run(web_interface.on_ptt_state_changed(False))
-				threading.Thread(target=notify_web, daemon=True).start()
+				_run_web_coro(web_interface, web_interface.on_ptt_state_changed(False))
 		
 		# Replace methods
 		radio_system.ptt_pressed = ptt_pressed_with_web
@@ -2005,23 +1970,14 @@ def setup_web_reception_callbacks(radio_system, web_interface, receiver):
 		else:
 			print(f"\n📨 [{from_station}]: {message}")
 		
-		# Notify web interface asynchronously
-		def notify_web():
-			try:
-				loop = asyncio.new_event_loop()
-				asyncio.set_event_loop(loop)
-				loop.run_until_complete(web_interface.on_message_received({
-					"content": message,
-					"from": str(from_station),
-					"type": "text",
-					"timestamp": datetime.now().isoformat(),
-					"direction": "incoming"
-				}))
-				loop.close()
-			except Exception as e:
-				print(f"Error notifying web interface: {e}")
-		
-		threading.Thread(target=notify_web, daemon=True).start()
+		# Notify web interface on its own loop (thread-safe)
+		_run_web_coro(web_interface, web_interface.on_message_received({
+			"content": message,
+			"from": str(from_station),
+			"type": "text",
+			"timestamp": datetime.now().isoformat(),
+			"direction": "incoming"
+		}))
 	
 	# Replace the display method if chat interface exists
 	if hasattr(radio_system, 'chat_interface'):

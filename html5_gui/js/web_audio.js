@@ -172,4 +172,16 @@
 	['pointerdown', 'keydown', 'touchstart'].forEach(function (ev) {
 		document.addEventListener(ev, gestureUnlock, { passive: true });
 	});
+
+	// When the tab comes back to the foreground, resume the context — browsers
+	// suspend AudioContexts on hidden/throttled tabs, which would otherwise leave
+	// RX playback dead until the next user gesture.
+	document.addEventListener('visibilitychange', function () {
+		if (!document.hidden && window.webAudioMode && ctx && ctx.state === 'suspended') {
+			ctx.resume().catch(function () {});
+		}
+	});
+	window.addEventListener('focus', function () {
+		if (window.webAudioMode && ctx && ctx.state === 'suspended') ctx.resume().catch(function () {});
+	});
 })();

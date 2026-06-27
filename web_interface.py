@@ -2633,6 +2633,9 @@ async def _start_mix_state_loop():
 		# so thread callbacks (received text) marshal onto it instead of spinning a
 		# throwaway loop, which would break the cross-loop asyncio.Lock.
 		web_interface._main_loop = asyncio.get_running_loop()
+		# (Re)create the send lock on THIS loop so it's bound to the uvicorn loop,
+		# not to some earlier loop that happened to touch it first.
+		web_interface._send_lock = asyncio.Lock()
 		web_interface._setup_mix_text_bridge(web_interface._main_loop)
 		asyncio.create_task(web_interface.mix_state_loop())
 		asyncio.create_task(web_interface.transmission_watchdog())
@@ -2709,17 +2712,9 @@ def setup_chat_integration(chat_interface, web_interface):
 							web_interface.on_message_received(payload), loop)
 					except Exception as e:
 						print(f"Error notifying web interface: {e}")
-				else:
-					# Fallback (shouldn't happen post-startup): one-shot loop.
-					def notify_web():
-						try:
-							l = asyncio.new_event_loop()
-							asyncio.set_event_loop(l)
-							l.run_until_complete(web_interface.on_message_received(payload))
-							l.close()
-						except Exception as e:
-							print(f"Error notifying web interface: {e}")
-					threading.Thread(target=notify_web, daemon=True).start()
+				# else: no main loop yet (pre-startup, no clients) — drop it. Never
+				# run a broadcast on a throwaway loop, or the send lock binds there
+				# and every later send fails ("bound to a different event loop").
 			
 			# Replace the method
 			chat_interface.display_received_message = enhanced_display

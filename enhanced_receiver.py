@@ -56,23 +56,26 @@ def _run_on_web_loop(web_interface, coro):
     fails to reach the browser. Falls back to a one-shot loop only if the main
     loop isn't registered yet (pre-startup)."""
     loop = getattr(web_interface, '_main_loop', None) if web_interface else None
-    if loop is not None:
+    if loop is None:
+        # No main loop yet (a frame arrived before uvicorn's startup ran). There
+        # are no web clients to receive this anyway, so DROP it. Never run a
+        # broadcast on a throwaway loop: the shared send lock would bind to that
+        # loop and every later send fails with "bound to a different event loop".
         try:
-            asyncio.run_coroutine_threadsafe(coro, loop)
-            return True
-        except Exception as e:
-            DebugConfig.debug_print(f"web-loop schedule error: {e}")
-            return False
-    def _oneshot():
+            coro.close()
+        except Exception:
+            pass
+        return False
+    try:
+        asyncio.run_coroutine_threadsafe(coro, loop)
+        return True
+    except Exception as e:
+        DebugConfig.debug_print(f"web-loop schedule error: {e}")
         try:
-            l = asyncio.new_event_loop()
-            asyncio.set_event_loop(l)
-            l.run_until_complete(coro)
-            l.close()
-        except Exception as e:
-            DebugConfig.debug_print(f"web notify (fallback) error: {e}")
-    threading.Thread(target=_oneshot, daemon=True).start()
-    return True
+            coro.close()
+        except Exception:
+            pass
+        return False
 
 
 class WebSocketBridge:
