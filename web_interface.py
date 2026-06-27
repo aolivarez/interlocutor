@@ -1000,6 +1000,22 @@ class EnhancedRadioWebInterface:
 
 
 
+	async def _stream_replay_to_browser(self, pcm: bytes):
+		"""Replay a recording to the browser PACED at 40 ms/frame (real-time), so
+		it plays smoothly through the same jitter-buffered Web Audio path as live
+		RX. Sending the whole recording as a burst would overrun the browser
+		scheduler (and trip its drift clamp), producing garbled/overlapping audio."""
+		try:
+			next_t = time.monotonic()
+			for off in range(0, len(pcm), 3840):        # 1920-sample (40 ms) mono frames
+				await self.broadcast_bytes(pcm[off:off + 3840])
+				next_t += 0.04
+				delay = next_t - time.monotonic()
+				if delay > 0:
+					await asyncio.sleep(delay)
+		except asyncio.CancelledError:
+			pass                                         # superseded by a newer replay
+
 	async def handle_transmission_playback_request(self, websocket: WebSocket, data: Dict):
 		"""Handle playback request using CLI speakers - FIXED for both incoming and outgoing"""
 		try:
@@ -1062,8 +1078,13 @@ class EnhancedRadioWebInterface:
 					d = packet.get('audio_data')
 					if d:
 						pcm.extend(d)
-				for off in range(0, len(pcm), 3840):     # 1920-sample (40 ms) mono frames
-					await self.broadcast_bytes(bytes(pcm[off:off + 3840]))
+				# Stream it PACED at real-time in the background (a burst overruns
+				# the browser's jitter buffer / trips the drift clamp → garbled),
+				# and so this handler returns immediately instead of blocking the
+				# client's WS for the whole recording.
+				if getattr(self, '_replay_task', None) and not self._replay_task.done():
+					self._replay_task.cancel()
+				self._replay_task = asyncio.create_task(self._stream_replay_to_browser(bytes(pcm)))
 				await self.send_to_client(websocket, {
 					"type": "transmission_playback_started",
 					"data": {"transmission_id": transmission_id, "direction": direction}
