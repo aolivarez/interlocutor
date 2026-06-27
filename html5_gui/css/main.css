@@ -63,7 +63,7 @@ body {
 /* Header Styles */
 .main-header {
 	background: var(--bg-glass);
-	backdrop-filter: blur(20px);
+	/* backdrop-filter: blur(20px); */ /* disabled: re-blurs every scroll/animation frame -> laggy scroll+typing */
 	border-bottom: 1px solid var(--border-glass);
 	padding: 1rem 2rem;
 	position: sticky;
@@ -174,7 +174,7 @@ body {
 /* Panel Styles */
 .panel {
 	background: var(--bg-glass);
-	backdrop-filter: blur(20px);
+	/* backdrop-filter: blur(20px); */ /* disabled: re-blurs every scroll/animation frame -> laggy scroll+typing */
 	border: 1px solid var(--border-glass);
 	border-radius: 20px;
 	padding: 1.5rem;
@@ -460,7 +460,7 @@ body {
 	background: var(--bg-glass);
 	color: var(--text-primary);
 	border: 2px solid var(--border-glass);
-	backdrop-filter: blur(10px);
+	/* backdrop-filter: blur(10px); */ /* disabled: paint cost on every button */
 	display: inline-flex;
 	align-items: center;
 	gap: 0.5rem;
@@ -954,3 +954,16 @@ body {
 .message.mix-recording { border-left: 3px solid #ff6b6b; }
 .mix-recording-label { font-weight: 600; margin-bottom: 0.3rem; }
 .message.mix-recording audio { margin-top: 0.2rem; }
+
+/* web-audio: Enable Audio button (unlocks mic + speaker) */
+.enable-audio-btn {
+	border: 1px solid rgba(57, 211, 83, 0.55);
+	background: transparent; color: #8ef0a4;
+	border-radius: 8px; padding: 0.4rem 0.7rem; cursor: pointer;
+	font-weight: 700; white-space: nowrap; align-self: center;
+}
+.enable-audio-btn:hover { background: rgba(57, 211, 83, 0.12); }
+.enable-audio-btn.on {
+	color: #cdd6e0; border-color: rgba(130, 170, 210, 0.4);
+	background: rgba(57, 211, 83, 0.10);
+}

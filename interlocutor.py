@@ -991,6 +991,22 @@ class GPIOZeroPTTHandler:
 			DebugConfig.system_print("📁 File transmit mode: live microphone disabled")
 			return
 
+		# Web-audio mode: no PyAudio at all. The mic arrives as PCM frames over the
+		# WebSocket (browser getUserMedia) and received audio is played in the
+		# browser. Just enforce the protocol params so encode/transmit still work.
+		if getattr(self.config, 'audio_via_browser', False):
+			self.sample_rate = 48000
+			self.frame_duration_ms = 40
+			self.samples_per_frame = 1920
+			self.bytes_per_frame = self.samples_per_frame * 2
+			self.audio_input_stream = None
+			self.selected_input_device = None
+			self.selected_output_device = None
+			self.audio_params = {'sample_rate': 48000, 'frame_duration_ms': 40,
+			                     'frames_per_buffer': 1920, 'channels': 1}
+			DebugConfig.system_print("🌐 Web-audio mode: audio I/O via browser (PyAudio disabled)")
+			return
+
 		# create device manager with our config
 		device_manager = AudioDeviceManager(
 			mode=AudioManagerMode.INTERACTIVE,
@@ -1081,8 +1097,12 @@ class GPIOZeroPTTHandler:
 				block_list=[],  # Block own frames only for now
 			)
 
-			# Setup audio output with the independently selected OUTPUT device
-			if hasattr(self, 'selected_output_device') and hasattr(self, 'audio_params'):
+			# Setup audio output with the independently selected OUTPUT device.
+			# In web-audio mode there's no local speaker — received audio is sent to
+			# the browser over the WebSocket — so skip the PyAudio output.
+			if getattr(self.config, 'audio_via_browser', False):
+				print("🌐 Web-audio mode: received audio routed to the browser (no PyAudio output)")
+			elif hasattr(self, 'selected_output_device') and hasattr(self, 'audio_params'):
 				print(f"🔊 Setting up received audio playback:")
 				print(f"   Using output device: {self.selected_output_device}")
 				print(f"   Audio parameters: {self.audio_params['sample_rate']}Hz, {self.audio_params['channels']} channel(s)")
@@ -1129,8 +1149,12 @@ class GPIOZeroPTTHandler:
 			return None
 		try:
 			from enhanced_receiver import MultiStationReceiver
+			# web-audio mode: no local speaker — the mix is sent to the browser
+			# (frame_sink wired by the web interface), so don't open PyAudio output.
+			web_audio = getattr(self.config, 'audio_via_browser', False)
 			self.mix_receiver = MultiStationReceiver(
 				listen_port=port,
+				play=not web_audio,
 				max_talkers=getattr(self.config.network, 'mix_max_talkers', 4))
 			self.mix_receiver.start()
 		except Exception as e:
@@ -1600,10 +1624,42 @@ class GPIOZeroPTTHandler:
 
 
 
+	def _start_web_audio_pump(self):
+		"""40 ms non-voice pump for web-audio mode. Replaces the PyAudio callback's
+		idle branch: when PTT is up the browser feeds audio_callback for voice;
+		when it's down this thread drains control/text and emits keepalives."""
+		import threading
+		def _pump():
+			next_t = time.time()
+			while getattr(self, 'running', True):
+				if not self.ptt_active:
+					try:
+						self.audio_frame_manager.process_nonvoice_and_transmit(time.time())
+					except Exception as e:
+						DebugConfig.debug_print(f"web-audio pump error: {e}")
+				# Sleep until the next 40 ms frame instead of a 1 ms busy-wait —
+				# a tight loop here thrashes the GIL and starves uvicorn's event
+				# loop, making the whole web UI laggy even when idle.
+				next_t += 0.040
+				delay = next_t - time.time()
+				if delay > 0:
+					time.sleep(delay)
+				else:
+					next_t = time.time()             # fell behind; resync
+		self._web_audio_pump_thread = threading.Thread(target=_pump, daemon=True)
+		self._web_audio_pump_thread.start()
+		DebugConfig.system_print("📡 Web-audio non-voice pump started (40 ms: keepalives + text/control)")
+
 	def start(self):
 		"""Start the continuous stream system"""
 		if self.audio_input_stream:
 			self.audio_input_stream.start_stream()
+		elif getattr(self.config, 'audio_via_browser', False):
+			# Web-audio mode: no PyAudio callback drives the 40 ms non-voice slot,
+			# and the browser only feeds audio during PTT. Run an independent timer
+			# so keepalives + text/control still go out when idle, mirroring
+			# audio_callback's no-voice branch in normal mode.
+			self._start_web_audio_pump()
 
 		# Start chat interface
 		self.chat_interface.start()

@@ -47,6 +47,34 @@ except ImportError:
     print("⚠️ TTS module not available")
 
 
+def _run_on_web_loop(web_interface, coro):
+    """Schedule a web-interface coroutine on its OWN (uvicorn) event loop.
+
+    Every WebSocket send — and the send lock that serializes them — must run on
+    that one loop. Spinning a throwaway asyncio loop per notification (the old
+    pattern here) breaks the cross-loop asyncio.Lock and the message silently
+    fails to reach the browser. Falls back to a one-shot loop only if the main
+    loop isn't registered yet (pre-startup)."""
+    loop = getattr(web_interface, '_main_loop', None) if web_interface else None
+    if loop is not None:
+        try:
+            asyncio.run_coroutine_threadsafe(coro, loop)
+            return True
+        except Exception as e:
+            DebugConfig.debug_print(f"web-loop schedule error: {e}")
+            return False
+    def _oneshot():
+        try:
+            l = asyncio.new_event_loop()
+            asyncio.set_event_loop(l)
+            l.run_until_complete(coro)
+            l.close()
+        except Exception as e:
+            DebugConfig.debug_print(f"web notify (fallback) error: {e}")
+    threading.Thread(target=_oneshot, daemon=True).start()
+    return True
+
+
 class WebSocketBridge:
     """Bridges MessageReceiver events to WebSocket interface"""
 
@@ -480,17 +508,19 @@ class EnhancedMessageReceiver:
                 if hasattr(self, 'audio_decoder') and self.audio_decoder.decoder_available:
                     audio_pcm = self.audio_decoder.decode_opus(rtp_payload)
                     if audio_pcm:
-                        # REAL-TIME PLAYBACK THROUGH HEADPHONES
+                        # REAL-TIME PLAYBACK THROUGH HEADPHONES (local PyAudio).
                         if self.audio_output and self.audio_output.playing:
                             self.audio_output.queue_audio_for_playback(audio_pcm, from_station)
                         else:
-                            DebugConfig.debug_print(f"🎤 Audio output NOT available")
-                            DebugConfig.debug_print(f"   Has audio_output: {hasattr(self, 'audio_output') and self.audio_output is not None}")
-                            if hasattr(self, 'audio_output') and self.audio_output:
-                                DebugConfig.debug_print(f"   Audio output playing: {self.audio_output.playing}")
-                            else:
-                                print(f"   Audio output is None")
-                            print(f"🔊 Audio output not active - voice will be silent")
+                            # No local output. In web-audio mode this is expected —
+                            # the audio is delivered to the browser via the web
+                            # notification below, so it is NOT silent. Only note it
+                            # (at debug level) when there's no web interface either.
+                            has_web = bool(getattr(self, 'web_bridge', None)
+                                           and getattr(self.web_bridge, 'web_interface', None))
+                            if not has_web:
+                                DebugConfig.debug_print(
+                                    "🔊 Audio output not active and no web interface - voice will be silent")
                             
                         # Web interface notification
                         self._notify_web_async('audio_received', {
@@ -602,22 +632,13 @@ class EnhancedMessageReceiver:
 
                 # Also send to web interface via the radio system if available
                 if hasattr(self, 'web_interface') and self.web_interface:
-                    def notify_web_control():
-                        try:
-                            loop = asyncio.new_event_loop()
-                            asyncio.set_event_loop(loop)
-                            loop.run_until_complete(self.web_interface.on_control_received({
-                                "content": control_msg,
-                                "from": from_station,
-                                "timestamp": timestamp,
-                                "type": "control"
-                            }))
-                            loop.close()
-                        except Exception as e:
-                            print(f"Error notifying web interface of control: {e}")
-                
-                    threading.Thread(target=notify_web_control, daemon=True).start()
-                
+                    _run_on_web_loop(self.web_interface, self.web_interface.on_control_received({
+                        "content": control_msg,
+                        "from": from_station,
+                        "timestamp": timestamp,
+                        "type": "control"
+                    }))
+
             elif not control_msg.startswith('KEEPALIVE'):
                 # Show non-keepalive control messages
                 DebugConfig.debug_print(f"📋 [{from_station}] Control: {control_msg}")
@@ -641,37 +662,23 @@ class EnhancedMessageReceiver:
 
 
     def _notify_web_async(self, event_type, data):
-        """Send async notification to web interface"""
-        def notify():
-            try:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-            
-                if event_type == 'audio_received':
-                    loop.run_until_complete(self.web_bridge.notify_audio_received(data))
-                elif event_type == 'control_received':
-                    # NEW: Handle control messages separately
-                    loop.run_until_complete(self.web_bridge.notify_control_received(data))
-                elif event_type == 'accessibility_announcement':
-                    # Route accessibility announcements directly as their own event type
-                    # — NOT as a message (which would create a ghost bubble in the UI)
-                    if self.web_bridge.web_interface:
-                        loop.run_until_complete(
-                            self.web_bridge.web_interface.broadcast_to_all({
-                                'type': 'accessibility_announcement',
-                                'data': data
-                            })
-                        )
-                else:
-                    # All other messages (text, etc.) go to message handler
-                    loop.run_until_complete(self.web_bridge.notify_message_received(data))
-                
-                self.stats['web_notifications'] += 1
-                loop.close()
-            except Exception as e:
-                DebugConfig.debug_print(f"Error in web notification: {e}")
-            
-        threading.Thread(target=notify, daemon=True).start()
+        """Send async notification to the web interface, on its own event loop."""
+        wi = getattr(self.web_bridge, 'web_interface', None)
+        if event_type == 'audio_received':
+            coro = self.web_bridge.notify_audio_received(data)
+        elif event_type == 'control_received':
+            coro = self.web_bridge.notify_control_received(data)
+        elif event_type == 'accessibility_announcement':
+            # Route accessibility announcements as their own event type — NOT as a
+            # message (which would create a ghost bubble in the UI)
+            if not wi:
+                return
+            coro = wi.broadcast_to_all({'type': 'accessibility_announcement', 'data': data})
+        else:
+            # All other messages (text, etc.) go to the message handler
+            coro = self.web_bridge.notify_message_received(data)
+        if _run_on_web_loop(wi, coro):
+            self.stats['web_notifications'] += 1
 
 
 
@@ -682,26 +689,16 @@ class EnhancedMessageReceiver:
         try:
             # Send transcription to web interface if available
             if self.web_bridge and self.web_bridge.web_interface:
-                def notify_web():
-                    try:
-                        loop = asyncio.new_event_loop()
-                        asyncio.set_event_loop(loop)
-                        loop.run_until_complete(
-                            self.web_bridge.web_interface.on_transcription_received({
-                                'transcription': result.text,
-                                'confidence': result.confidence,
-                                'language': result.language,
-                                'station_id': result.station_id,
-                                'timestamp': result.timestamp,
-                                'direction': result.direction,
-                                'transmission_id': result.transmission_id
-                            })
-                        )
-                        loop.close()
-                    except Exception as e:
-                        print(f"Error notifying web interface of transcription: {e}")
-            
-                threading.Thread(target=notify_web, daemon=True).start()
+                _run_on_web_loop(self.web_bridge.web_interface,
+                    self.web_bridge.web_interface.on_transcription_received({
+                        'transcription': result.text,
+                        'confidence': result.confidence,
+                        'language': result.language,
+                        'station_id': result.station_id,
+                        'timestamp': result.timestamp,
+                        'direction': result.direction,
+                        'transmission_id': result.transmission_id
+                    }))
         
             # CLI mode: print transcription if no web interface
             elif not self.web_bridge.web_interface:
@@ -1201,6 +1198,7 @@ class MultiStationReceiver:
         self.out_stream = None
         self.wav = None
         self._rec_path = None
+        self.frame_sink = None        # fn(stereo_pcm) -> push mix to browser (web-audio)
         self._mono_bytes = self.FRAME_SAMPLES * 2          # 3840
         self._silence_mono = b'\x00' * self._mono_bytes
         self._silence_stereo = b'\x00' * (self._mono_bytes * 2)   # 7680
@@ -1486,16 +1484,17 @@ class MultiStationReceiver:
             g = st.gain * self.MASTER_GAIN
             stereo = audioop.tostereo(frame, 2, lg * g, rg * g)   # pan
             acc = stereo if acc is None else audioop.add(acc, stereo, 2)  # sum
-        return acc if acc is not None else self._silence_stereo
+        # (frame, had_audio): had_audio = a station actually contributed this tick
+        return (acc, True) if acc is not None else (self._silence_stereo, False)
 
     def _mix_loop(self):
         """40 ms mix clock. Paced by the blocking device write when a device is
-        open; otherwise (record-only) paced by the wall clock."""
+        open; otherwise (record-only / browser-sink) paced by the wall clock."""
         print("🎚️  mixer running")
         frame_dt = self.FRAME_SAMPLES / float(self.SAMPLE_RATE)   # 0.04 s
         next_t = time.time()
         while self.running:
-            out = self._mix_one_frame()
+            out, had_audio = self._mix_one_frame()
             paced = False
             if self.out_stream is not None:
                 try:
@@ -1506,6 +1505,13 @@ class MultiStationReceiver:
             if self.wav is not None:
                 try:
                     self.wav.writeframes(out)
+                except Exception:
+                    pass
+            # Browser sink (web-audio mode): push the mixed STEREO frame, but only
+            # when a station is actually talking (don't flood with silence).
+            if had_audio and self.frame_sink is not None:
+                try:
+                    self.frame_sink(out)
                 except Exception:
                     pass
             if not paced:

@@ -37,6 +37,11 @@ class EnhancedRadioWebInterface:
 		self.config = config
 		self.config_manager = config_manager
 		self.websocket_clients: Set[WebSocket] = set()
+		# Serialize all WebSocket sends — text JSON broadcasts and the binary
+		# web-audio frames come from many tasks; concurrent sends on one socket
+		# interleave bytes and corrupt the frame stream (JSON parse errors).
+		self._send_lock = asyncio.Lock()
+		self._main_loop = None        # the uvicorn event loop (set at startup)
 		self.status_cache = {}
 		self.message_history = []
 		
@@ -452,7 +457,8 @@ class EnhancedRadioWebInterface:
 	async def send_to_client(self, websocket: WebSocket, message: Dict):
 		"""Send message to specific client"""
 		try:
-			await websocket.send_text(json.dumps(message))
+			async with self._send_lock:
+				await websocket.send_text(json.dumps(message))
 		except Exception as e:
 			self.logger.warning(f"Failed to send to client: {e}")
 			self.websocket_clients.discard(websocket)
@@ -560,6 +566,13 @@ class EnhancedRadioWebInterface:
 						"direction": "incoming"
 					}
 				})
+
+				# Web-audio mode: push the decoded PCM to the browser as a binary
+				# frame for real-time playback (no local PyAudio speaker).
+				if self._web_audio_mode():
+					pcm = audio_data.get('audio_data')
+					if pcm:
+						await self.broadcast_bytes(bytes(pcm))
 
 		except Exception as e:
 			print(f"📡 TRANSMISSION AUDIO ERROR: {e}")
@@ -734,6 +747,17 @@ class EnhancedRadioWebInterface:
 				pass
 		mix.text_callback = cb
 
+		# web-audio mode: send the mixed stereo audio to the browser instead of a
+		# local speaker (the mixer is started with play=False in this mode).
+		if self._web_audio_mode():
+			def frame_cb(stereo_pcm):
+				try:
+					asyncio.run_coroutine_threadsafe(
+						self.broadcast_bytes(bytes(stereo_pcm)), loop)
+				except Exception:
+					pass
+			mix.frame_sink = frame_cb
+
 	async def _display_mix_text(self, callsign, text):
 		"""Show a mixed-station text message in the chat (same path as normal RX text)."""
 		await self.on_message_received({
@@ -773,14 +797,38 @@ class EnhancedRadioWebInterface:
 				})
 
 	async def mix_state_loop(self, interval: float = 0.25):
-		"""Periodic Active Mix roster push (~4 Hz) so the bubble stays live."""
+		"""Periodic Active Mix roster push (~4 Hz) while stations are active. When
+		the mix is idle we stop broadcasting (sending one final empty roster to
+		clear the bubble) so we don't spam every client at 4 Hz for nothing."""
+		was_active = False
 		while True:
 			try:
-				if self.websocket_clients and self._mix_receiver():
-					await self.broadcast_mix_state()
+				mix = self._mix_receiver()
+				if self.websocket_clients and mix:
+					active = bool(mix.active_stations())
+					if active or was_active:        # active, or just went idle (clear once)
+						await self.broadcast_mix_state()
+					was_active = active
 			except Exception as e:
 				DebugConfig.debug_print(f"mix_state_loop error: {e}")
 			await asyncio.sleep(interval)
+
+	def _web_audio_mode(self):
+		"""True when audio I/O is via the browser (--web-audio)."""
+		return bool(getattr(self.config, 'audio_via_browser', False))
+
+	async def broadcast_bytes(self, data: bytes):
+		"""Send a binary frame to all clients (web-audio RX: raw PCM playback)."""
+		if not self.websocket_clients:
+			return
+		dead = set()
+		for websocket in self.websocket_clients.copy():
+			try:
+				async with self._send_lock:
+					await websocket.send_bytes(data)
+			except Exception:
+				dead.add(websocket)
+		self.websocket_clients -= dead
 
 	async def broadcast_to_all(self, message: Dict):
 		"""Broadcast message to all connected clients with debugging"""
@@ -793,9 +841,11 @@ class EnhancedRadioWebInterface:
 		disconnected = set()
 		successful_sends = 0
     
+		payload = json.dumps(message)
 		for websocket in self.websocket_clients.copy():
 			try:
-				await websocket.send_text(json.dumps(message))
+				async with self._send_lock:
+					await websocket.send_text(payload)
 				successful_sends += 1
 			except Exception as e:
 				print(f"🌐 BROADCAST DEBUG: Failed to send to client: {e}")
@@ -1003,7 +1053,23 @@ class EnhancedRadioWebInterface:
 				return
 		
 			DebugConfig.debug_print(f"🎵 REQUEST PLAYBACK: Found {direction} transmission with {len(audio_packets)} packets")
-			
+
+			# Web-audio mode: no CLI speaker — stream the recording to the browser
+			# as binary PCM frames, played by the same Web Audio path as live RX.
+			if self._web_audio_mode():
+				pcm = bytearray()
+				for packet in audio_packets:
+					d = packet.get('audio_data')
+					if d:
+						pcm.extend(d)
+				for off in range(0, len(pcm), 3840):     # 1920-sample (40 ms) mono frames
+					await self.broadcast_bytes(bytes(pcm[off:off + 3840]))
+				await self.send_to_client(websocket, {
+					"type": "transmission_playback_started",
+					"data": {"transmission_id": transmission_id, "direction": direction}
+				})
+				return
+
 			# Get AudioOutputManager from enhanced receiver
 			audio_output_manager = None
 			if (self.radio_system and 
@@ -1378,6 +1444,20 @@ class EnhancedRadioWebInterface:
 				"type": "error",
 				"message": f"Failed to release PTT: {str(e)}"
 			})
+
+	def handle_tx_audio(self, pcm_bytes):
+		"""Web-audio TX: feed a browser mic PCM frame (48 kHz mono int16,
+		1920 samples = 3840 B) into the radio's normal TX path. audio_callback
+		only encodes/transmits while PTT is active, so the browser keys via the
+		ptt_pressed/released commands exactly like a hardware PTT."""
+		radio = self.radio_system
+		if radio is None or not hasattr(radio, 'audio_callback'):
+			return
+		try:
+			n = getattr(radio, 'samples_per_frame', 1920)
+			radio.audio_callback(pcm_bytes, n, None, 0)
+		except Exception as e:
+			self.logger.debug(f"web-audio TX error: {e}")
 
 	async def handle_get_message_history(self, websocket: WebSocket):
 		"""Send complete message history to client"""
@@ -2459,6 +2539,7 @@ class EnhancedRadioWebInterface:
 			"station_id": str(self.radio_system.station_id) if self.radio_system else "DISCONNECTED",
 			"ptt_active": self.ptt_state,
 			"debug_mode": self._get_debug_mode(),
+			"web_audio": bool(getattr(self.config, 'audio_via_browser', False)),
 			"timestamp": datetime.now().isoformat(),
 			"config": {
 				"target_ip": self.config.network.target_ip if self.config else "unknown",
@@ -2548,7 +2629,11 @@ async def _start_mix_state_loop():
 	"""Background tasks: push the Active Mix roster (~4 Hz) and auto-finalize
 	transmissions that go silent without a PTT_STOP boundary."""
 	if web_interface:
-		web_interface._setup_mix_text_bridge(asyncio.get_running_loop())
+		# Every WebSocket send (and the send lock) must run on THIS loop — stash it
+		# so thread callbacks (received text) marshal onto it instead of spinning a
+		# throwaway loop, which would break the cross-loop asyncio.Lock.
+		web_interface._main_loop = asyncio.get_running_loop()
+		web_interface._setup_mix_text_bridge(web_interface._main_loop)
 		asyncio.create_task(web_interface.mix_state_loop())
 		asyncio.create_task(web_interface.transmission_watchdog())
 
@@ -2612,22 +2697,29 @@ def setup_chat_integration(chat_interface, web_interface):
 				# Call original display for terminal
 				original_display(from_station, message)
 				
-				# Also send to web interface in a thread-safe way
-				def notify_web():
+				# Marshal onto the main uvicorn loop so the broadcast (and its send
+				# lock) run on the same loop as every other WebSocket send. Spinning
+				# a throwaway loop here breaks the cross-loop asyncio.Lock and the
+				# message silently fails to reach the browser.
+				payload = {"content": message, "from": from_station, "type": "text"}
+				loop = getattr(web_interface, "_main_loop", None)
+				if loop is not None:
 					try:
-						loop = asyncio.new_event_loop()
-						asyncio.set_event_loop(loop)
-						loop.run_until_complete(web_interface.on_message_received({
-							"content": message,
-							"from": from_station,
-							"type": "text"
-						}))
-						loop.close()
+						asyncio.run_coroutine_threadsafe(
+							web_interface.on_message_received(payload), loop)
 					except Exception as e:
 						print(f"Error notifying web interface: {e}")
-				
-				# Run in separate thread to avoid blocking
-				threading.Thread(target=notify_web, daemon=True).start()
+				else:
+					# Fallback (shouldn't happen post-startup): one-shot loop.
+					def notify_web():
+						try:
+							l = asyncio.new_event_loop()
+							asyncio.set_event_loop(l)
+							l.run_until_complete(web_interface.on_message_received(payload))
+							l.close()
+						except Exception as e:
+							print(f"Error notifying web interface: {e}")
+					threading.Thread(target=notify_web, daemon=True).start()
 			
 			# Replace the method
 			chat_interface.display_received_message = enhanced_display
@@ -2646,8 +2738,17 @@ async def websocket_endpoint(websocket: WebSocket):
 		await web_interface.connect_websocket(websocket)
 		
 		while True:
-			# Receive messages from client
-			data = await websocket.receive_text()
+			# Receive messages from client. Text = JSON GUI command; binary = a
+			# raw PCM mic frame (web-audio mode: 48 kHz mono int16, 1920 samples).
+			message = await websocket.receive()
+			if message.get("type") == "websocket.disconnect":
+				break
+			if message.get("bytes") is not None:
+				web_interface.handle_tx_audio(message["bytes"])
+				continue
+			data = message.get("text")
+			if data is None:
+				continue
 			try:
 				command = json.loads(data)
 				await web_interface.handle_gui_command(websocket, command)

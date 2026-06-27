@@ -201,7 +201,7 @@
 		var(--accent-color) 80%, 
 		transparent 100%);
 	transform: translateY(-50%);
-	animation: audio-wave 2s infinite;
+	/* animation: audio-wave 2s infinite; */ /* disabled: runs forever on EVERY audio bubble -> repaint lag scales with visible bubbles */
 }
 
 @keyframes audio-wave {
@@ -284,7 +284,7 @@
 	left: 50%;
 	transform: translate(-50%, -50%);
 	background: var(--bg-glass);
-	backdrop-filter: blur(20px);
+	/* backdrop-filter: blur(20px); */ /* disabled: scroll/paint lag */
 	border: 2px solid var(--border-glass);
 	border-radius: 20px;
 	padding: 2rem;
@@ -489,7 +489,7 @@
 
 /* Audio icon pulse animation */
 .audio-icon {
-	animation: pulse-audio 2s infinite;
+	/* animation: pulse-audio 2s infinite; */ /* disabled: runs forever per audio bubble -> repaint lag */
 }
 
 @keyframes pulse-audio {

@@ -122,8 +122,14 @@
 						<span>Station: </span>
 						<strong id="current-station">CONNECTING...</strong>
 					</div>
-					
-					<button id="ptt-button" 
+
+					<!-- web-audio mode: unlock browser audio (mic + speaker) -->
+					<button id="enable-audio-btn" class="enable-audio-btn" type="button"
+							title="Enable browser audio (mic + speaker)" hidden>
+						🔊 Enable Audio
+					</button>
+
+					<button id="ptt-button"
 							class="ptt-button" 
 							aria-pressed="false"
 							aria-describedby="ptt-help"
@@ -651,6 +657,7 @@
 	<script src="/static/js/websocket.js"></script>
 	<script src="/static/js/app.js"></script>
 	<script src="/static/js/audio.js"></script>
+	<script src="/static/js/web_audio.js"></script>
 	<script src="/static/js/config.js"></script>
 	<script src="/static/js/accessibility_announcements.js"></script>
 

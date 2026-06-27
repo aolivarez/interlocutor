@@ -156,9 +156,10 @@ function endTransmission(stationId, endTime, forced = false) {
 // Handle individual audio packets and add to active transmission
 function handleReceivedAudioPacket(audioData) {
 	const stationId = audioData.from_station;
-	
-	console.log(`🎤 Audio packet from ${stationId}: ${audioData.duration_ms}ms`);
-	
+
+	// Per-frame log disabled — runs ~25x/sec during RX and lags the UI (esp. with DevTools open):
+	//console.log(`🎤 Audio packet from ${stationId}: ${audioData.duration_ms}ms`);
+
 	// Get active transmission
 	let transmission = activeTransmissions.get(stationId);
 	
@@ -183,8 +184,9 @@ function handleReceivedAudioPacket(audioData) {
 	
 	// Continue real-time audio playback (don't interfere with live audio)
 	playLiveAudio(audioData);
-	
-	console.log(`🎤 Added packet to transmission ${transmission.transmissionId} (${transmission.audioPackets.length} packets, ${transmission.totalDuration}ms total)`);
+
+	// Per-frame log disabled — runs ~25x/sec during RX and lags the UI:
+	//console.log(`🎤 Added packet to transmission ${transmission.transmissionId} (${transmission.audioPackets.length} packets, ${transmission.totalDuration}ms total)`);
 }
 
 // Auto-timeout incomplete transmissions (fallback for missing PTT_STOP)
@@ -353,9 +355,10 @@ function endOutgoingTransmission(stationId, endTime, transmissionId) {
 
 function handleOutgoingAudioPacket(audioData) {
 	const stationId = audioData.from_station;
-	
-	console.log(`📤 OUTGOING AUDIO: Audio packet from ${stationId}: ${audioData.duration_ms}ms`);
-	
+
+	// Per-frame log disabled — runs ~25x/sec while transmitting and lags the UI:
+	//console.log(`📤 OUTGOING AUDIO: Audio packet from ${stationId}: ${audioData.duration_ms}ms`);
+
 	// Get active outgoing transmission
 	let transmission = activeOutgoingTransmissions.get(stationId);
 	
@@ -377,8 +380,9 @@ function handleOutgoingAudioPacket(audioData) {
 	
 	// Reset auto-timeout for this outgoing transmission
 	resetOutgoingTransmissionTimeout(stationId);
-	
-	console.log(`📤 Added packet to outgoing transmission ${transmission.transmissionId} (${transmission.audioPackets.length} packets, ${transmission.totalDuration}ms total)`);
+
+	// Per-frame log disabled — runs ~25x/sec while transmitting and lags the UI:
+	//console.log(`📤 Added packet to outgoing transmission ${transmission.transmissionId} (${transmission.audioPackets.length} packets, ${transmission.totalDuration}ms total)`);
 }
 
 function resetOutgoingTransmissionTimeout(stationId) {
@@ -515,7 +519,8 @@ function playLiveAudio(audioData) {
 	const autoPlayCheckbox = document.getElementById('auto-play-audio');
 	if (autoPlayCheckbox && autoPlayCheckbox.checked) {
 		// Note: Individual packet playback disabled - only transmission playback now
-		console.log(`📊 Live audio from ${audioData.from_station} continues playing`);
+		// Per-frame log disabled — runs ~25x/sec and lags the UI:
+		//console.log(`📊 Live audio from ${audioData.from_station} continues playing`);
 	}
 }
 

@@ -265,15 +265,22 @@ function togglePTT() {
 
 function activatePTT() {
 	if (pttActive || !ws || ws.readyState !== WebSocket.OPEN) return;
-	
+
 	sendWebSocketMessage('ptt_pressed');
+	// web-audio mode: start streaming the browser mic to the server
+	if (window.webAudioMode && typeof window.webAudioStartTx === 'function') {
+		window.webAudioStartTx();
+	}
 	handlePTTStateChange(true);
 	addLogEntry('PTT activated', 'info');
 }
 
 function deactivatePTT() {
 	if (!pttActive) return;
-	
+
+	if (window.webAudioMode && typeof window.webAudioStopTx === 'function') {
+		window.webAudioStopTx();
+	}
 	sendWebSocketMessage('ptt_released');
 	handlePTTStateChange(false);
 	addLogEntry('PTT released', 'info');
@@ -308,7 +315,28 @@ function updateSystemStatus(data) {
 function populateStatusFromData(status) {
 	currentStation = status.station_id || 'DISCONNECTED';
 	document.getElementById('current-station').textContent = currentStation;
-	
+
+	// web-audio mode: this browser provides the mic/speaker (no server PyAudio)
+	window.webAudioMode = !!status.web_audio;
+	if (window.webAudioMode) {
+		var enBtn = document.getElementById('enable-audio-btn');
+		if (enBtn) {
+			enBtn.hidden = false;
+			if (!enBtn._bound) {
+				enBtn._bound = true;
+				enBtn.addEventListener('click', async function () {
+					// unlock playback (RX) and request the mic (TX) up front
+					var ok = (typeof window.webAudioUnlock === 'function') && window.webAudioUnlock();
+					if (typeof window.webAudioRequestMic === 'function') {
+						await window.webAudioRequestMic();   // triggers the mic permission prompt
+					}
+					enBtn.textContent = ok ? '🔊 Audio On' : '🔊 Enable Audio';
+					enBtn.classList.toggle('on', !!ok);
+				});
+			}
+		}
+	}
+
 	if (status.config) {
 		const targetIpElement = document.getElementById('target-ip');
 		const targetPortElement = document.getElementById('target-port');
@@ -637,19 +665,26 @@ function updateStatDisplay(statId, value) {
 }
 
 // Update audio reception statistics
+let _audioRxCount = 0;
+let _audioStatLastWrite = 0;
+let _audioStatLatest = null;
 function updateAudioReceptionStats(audioData) {
-	// Update audio reception counter
+	// Called ~25x/sec during RX — keep the per-frame work trivial (just count),
+	// and throttle the actual DOM writes (textContent reflow + toLocaleTimeString)
+	// to ~4x/sec so heavy audio doesn't make the UI feel sluggish.
+	_audioRxCount++;
+	_audioStatLatest = audioData;
+	const now = (window.performance && performance.now) ? performance.now() : Date.now();
+	if (now - _audioStatLastWrite < 250) return;
+	_audioStatLastWrite = now;
+
 	const audioCounter = document.getElementById('audio-received-count');
-	if (audioCounter) {
-		const current = parseInt(audioCounter.textContent) || 0;
-		audioCounter.textContent = current + 1;
-	}
-	
-	// Update last received audio info
+	if (audioCounter) audioCounter.textContent = _audioRxCount;
+
 	const lastAudioInfo = document.getElementById('last-audio-info');
-	if (lastAudioInfo) {
-		const time = new Date(audioData.timestamp).toLocaleTimeString();
-		lastAudioInfo.textContent = `${audioData.from_station} at ${time}`;
+	if (lastAudioInfo && _audioStatLatest) {
+		const time = new Date(_audioStatLatest.timestamp).toLocaleTimeString();
+		lastAudioInfo.textContent = `${_audioStatLatest.from_station} at ${time}`;
 	}
 }
 

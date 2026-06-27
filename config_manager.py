@@ -1056,6 +1056,11 @@ def apply_gui_cli_overrides(config: OpulentVoiceConfig, args) -> OpulentVoiceCon
 	# Web interface overrides
 	if hasattr(args, 'web_interface') and args.web_interface:
 		config.ui.web_interface_enabled = True
+
+	# Web-audio mode: audio I/O via the browser; implies the web interface.
+	if hasattr(args, 'web_audio') and args.web_audio:
+		config.audio_via_browser = True
+		config.ui.web_interface_enabled = True
 	
 	if hasattr(args, 'web_port') and args.web_port:
 		config.ui.web_interface_port = args.web_port
@@ -1100,6 +1105,11 @@ def apply_gui_cli_overrides(config: OpulentVoiceConfig, args) -> OpulentVoiceCon
 	
 	# Web interface overrides
 	if hasattr(args, 'web_interface') and args.web_interface:
+		config.ui.web_interface_enabled = True
+
+	# Web-audio mode: audio I/O via the browser; implies the web interface.
+	if hasattr(args, 'web_audio') and args.web_audio:
+		config.audio_via_browser = True
 		config.ui.web_interface_enabled = True
 	
 	if hasattr(args, 'web_port') and args.web_port:
@@ -1377,7 +1387,13 @@ Configuration:
 		action='store_true',
 		help='Enable web interface mode'
 	)
-	
+	gui_group.add_argument(
+		'--web-audio',
+		action='store_true',
+		help='Audio I/O via the browser (getUserMedia mic + Web Audio playback) '
+		     'instead of PyAudio. Runs headless on the modem; implies --web-interface.'
+	)
+
 	gui_group.add_argument(
 		'--web-port',
 		type=int,

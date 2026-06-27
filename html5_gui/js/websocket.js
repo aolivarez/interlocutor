@@ -118,14 +118,24 @@ function connectWebSocket() {
             }
         };
 
+        ws.binaryType = 'arraybuffer';   // web-audio RX arrives as binary PCM frames
         ws.onmessage = function(event) {
+            // Binary frame = a real-time RX PCM frame (web-audio mode) -> play it.
+            if (typeof event.data !== 'string') {
+                if (typeof window.webAudioPlayRx === 'function') window.webAudioPlayRx(event.data);
+                return;
+            }
             try {
                 const message = JSON.parse(event.data);
-                console.log(`📨 ${new Date().toISOString()}: Received ${message.type} message`);
-                
+                // Don't spam the console with high-frequency messages (mix_state ~4 Hz,
+                // per-frame audio) — they make the console unusable for debugging.
+                if (message.type !== 'mix_state' && message.type !== 'audio_received') {
+                    console.log(`📨 ${new Date().toISOString()}: Received ${message.type} message`);
+                }
+
                 // STEP 7: Reset failure counter on successful message
                 window.connectionFailures = 0;
-                
+
                 handleWebSocketMessage(message);
             } catch (e) {
                 addLogEntry(`Error parsing message: ${e.message}`, 'error');
